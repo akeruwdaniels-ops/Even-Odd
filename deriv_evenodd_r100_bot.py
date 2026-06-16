@@ -73,9 +73,9 @@ from scipy import stats
 # ══════════════════════════════════════════════════════════════════════════
 CFG = {
     # ── Contract ──
-    "underlying_symbol": "R_10",
+    "underlying_symbol": "R_100",
     "currency":          "USD",
-    "duration":          1,
+    "duration":          5,
     "duration_unit":     "t",
 
     # ── Capital ──
