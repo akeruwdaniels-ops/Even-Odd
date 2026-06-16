@@ -73,13 +73,13 @@ from scipy import stats
 # ══════════════════════════════════════════════════════════════════════════
 CFG = {
     # ── Contract ──
-    "underlying_symbol": "R_100",
+    "underlying_symbol": "R_10",
     "currency":          "USD",
     "duration":          1,
     "duration_unit":     "t",
 
     # ── Capital ──
-    "starting_bankroll":  1.50,
+    "starting_bankroll":  2.5,
     "stake":              0.35,
     "drawdown_stop":      0.80,    # halt below this bankroll
 
