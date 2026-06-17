@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (RDBEAR)          ║
-║  Symbol   : RDBEAR  (Bear Market Index, 1-second ticks)              ║
+║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (1HZ10V)          ║
+║  Symbol   : 1HZ10V  (Volatility 10 Index, 1-second ticks)           ║
 ║  Contract : EXPIRYRANGE  ("Ends Between" — terminal price only)      ║
 ║  Duration : 2 minutes  (120 ticks to terminal price)                 ║
 ║  Barriers : ±2.70 relative to entry spot  (auto-calibrated)         ║
@@ -103,28 +103,14 @@ CFG = {
     "drawdown_stop":     0.10,
 
     # ── Kelly staking ──
-    # FIX (Issue 3): Kelly now active from starting bankroll (1.0).
-    # Activation at 5.0 meant Kelly never ran on a $1 account.
-    # kelly_fraction set to 0.25 (quarter-Kelly) — conservative on a small
-    # float; prevents over-betting on early noisy win-rate estimates.
-    # kelly_max_fraction_of_bankroll capped at 0.35 so Kelly never exceeds
-    # what the flat-stake baseline would have bet.
-    #
-    # FIX (Issue 6): payout_ratio corrected to actual Deriv return.
-    # A $0.35 stake returns $0.18 profit → b = 0.18 / 0.35 = 0.5143.
-    # Kelly formula: f* = (b*p - q) / b — using wrong b distorts sizing.
-    "kelly_activation_bankroll":      1.0,
-    "kelly_fraction":                 0.25,
+    "kelly_activation_bankroll":      5.0,
+    "kelly_fraction":                 0.5,
     "kelly_min_stake":                0.35,
-    "kelly_max_fraction_of_bankroll": 0.35,
-    "payout_ratio":                   0.5143,  # 0.18 profit / 0.35 stake
+    "kelly_max_fraction_of_bankroll": 0.10,
+    "payout_ratio":                   0.50,   # target 50%+ return
 
     # ── Signal accuracy gates ──
-    # warmup_ticks is no longer the trading gate — that role is now owned by
-    # the startup calibration (calib_min_ticks=720).  This value is kept for
-    # model-buffer documentation only, aligned to calib_min_ticks so every
-    # model always has at least 720 ticks of data when it first runs.
-    "warmup_ticks":       720,
+    "warmup_ticks":       120,
     "signal_interval":    5,
     "stage1_mc_n":        10_000,
     "stage2_mc_n":        50_000,
@@ -160,9 +146,6 @@ CFG = {
     "ao_slow_period":          34,
     # Veto if |AO| > this — market energy too high for a rangebound outcome
     "ao_veto_threshold":       1.93768,
-    # FIX (Issue 5): ticks per OHLC bar feeding the AO. 5 ticks/bar on
-    # 1HZ10V ≈ 5s bars, so SMA(34 bars) spans ~2.8 min.
-    "ao_bar_ticks":            5,
 
     # ── Jump / spike detection (L8) ──
     "jump_window":        60,
@@ -366,21 +349,13 @@ class MonteCarlo:
       Stage 1: 10K quick pre-scan.
       Stage 2: 50K deep confirm with CI-based GUARANTEE check.
 
-    Terminal-price guarantee:
+    Terminal-price guarantee (new):
       After the 50K run, we compute the 95% confidence interval on the
       MC win-probability estimate. The trade fires only if:
           p_blend - CI_halfwidth >= CFG["mc_guarantee_floor"]
       i.e. even the LOWER bound of our estimate still clears the gate.
-
-    FIX (Issue 1): MC now simulates full tick-by-tick paths (n_ticks steps)
-    rather than drawing a single terminal price from a normal distribution.
-    This correctly captures path-level variance: a contract can breach the
-    barrier mid-path and recover at terminal — the old single-draw approach
-    was blind to this and consistently overstated win probability.
-
-    The analytic CDF (which is also terminal-only) is retained but its blend
-    weight is reduced from 0.60 → 0.40 since the path MC is now the primary
-    estimator.
+      This ensures we don't enter on a lucky high-p sample when the
+      true probability is marginal.
 
     Returns (p_blend, ci_halfwidth).
     """
@@ -397,36 +372,25 @@ class MonteCarlo:
         ou_mu_T:    Optional[float] = None,
         ou_var_T:   Optional[float] = None,
     ) -> tuple:
-        # Derive per-tick OU parameters when available, else use GBM drift/sigma
         if ou_mu_T is not None and ou_var_T is not None:
-            # Convert OU terminal moments back to per-tick equivalents
-            sigma_tick_eff = max(float(ou_var_T) ** 0.5 / max(n_ticks ** 0.5, 1), 1e-9)
-            drift_eff      = float(ou_mu_T) / max(n_ticks, 1)
+            mu_T    = float(ou_mu_T)
+            sigma_T = max(float(ou_var_T) ** 0.5, 1e-9)
         else:
-            sigma_tick_eff = max(sigma_tick, 1e-9)
-            drift_eff      = drift
+            sigma_T = sigma_tick * n_ticks ** 0.5
+            mu_T    = drift * n_ticks
+            sigma_T = max(sigma_T, 1e-9)
 
-        # ── Path-level Monte Carlo (FIX: tick-by-tick walk, n_ticks steps) ──
-        # Shape: (n_simulations, n_ticks) of N(drift, sigma) increments
-        increments = np.random.normal(
-            drift_eff, sigma_tick_eff, (self.n, n_ticks)
-        )
-        # Cumulative price displacement from entry (entry = 0)
-        paths      = np.cumsum(increments, axis=1)
-        # Terminal displacement only (EXPIRYRANGE checks only terminal tick)
-        terminal   = paths[:, -1]
-        p_mc       = float(np.mean(np.abs(terminal) < barrier))
-        ci         = float(1.96 * (p_mc * (1.0 - p_mc) / self.n) ** 0.5)
-
-        # ── Analytic CDF (terminal-only, kept as secondary reference) ──
-        sigma_T    = sigma_tick_eff * n_ticks ** 0.5
-        mu_T       = drift_eff * n_ticks
+        # Analytic CDF
         z_hi       = ( barrier - mu_T) / sigma_T
         z_lo       = (-barrier - mu_T) / sigma_T
         p_analytic = float(stats.norm.cdf(z_hi) - stats.norm.cdf(z_lo))
 
-        # Blend: path MC is now primary (0.60), analytic CDF secondary (0.40)
-        p_blend = float(np.clip(0.60 * p_mc + 0.40 * p_analytic, 0.0, 1.0))
+        # Stochastic MC
+        draws  = np.random.normal(mu_T, sigma_T, self.n)
+        p_mc   = float(np.mean(np.abs(draws) < barrier))
+        ci     = float(1.96 * (p_mc * (1.0 - p_mc) / self.n) ** 0.5)
+
+        p_blend = float(np.clip(0.60 * p_analytic + 0.40 * p_mc, 0.0, 1.0))
         return p_blend, ci
 
 
@@ -434,70 +398,31 @@ class MonteCarlo:
 # LAYER 3 — HMM (3-state regime)
 # ══════════════════════════════════════════════════════════════════════
 class HMMRegimes:
-    """
-    FIX (Issue 4): Replaced static sigma-bucket lookup with a proper
-    Gaussian-emission HMM forward pass (scaled alpha recursion).
-
-    Each hidden state s emits sigma_t ~ N(mu_s, std_s).  The emission
-    probability p(sigma_t | state=s) is evaluated at every tick, and the
-    forward variable alpha[s] = P(o_1..o_t, state_t=s) is updated via:
-
-        alpha_t[s] = emission(sigma_t | s) * sum_j(A[j,s] * alpha_{t-1}[j])
-
-    State means/stds are seeded from calibration data and updated in-place
-    by the AutoCalibrator via update_emission_params().
-    This gives the HMM genuine probabilistic state inference rather than
-    a deterministic bucket assignment.
-    """
     LOW, MED, HIGH = 0, 1, 2
+    _LO = 0.15
+    _HI = 0.40
 
-    # Transition matrix  (row = from, col = to)
     _A = np.array([
         [0.87, 0.10, 0.03],
         [0.09, 0.80, 0.11],
         [0.03, 0.14, 0.83],
     ])
-    # Emission distribution parameters (mu, std) per state.
-    # Seeded conservatively; AutoCalibrator overwrites from live data.
-    _MU  = np.array([0.15, 0.30, 0.50])   # mean sigma_t per state
-    _STD = np.array([0.04, 0.06, 0.10])   # std  sigma_t per state
-
-    # Win-rate prior per regime (used as HMM signal score)
     _PRIOR = {0: 0.83, 1: 0.61, 2: 0.32}
 
     def __init__(self):
         self.state  = self.MED
-        self._alpha = np.array([0.15, 0.70, 0.15])   # initial belief
+        self._alpha = np.array([0.15, 0.70, 0.15])
 
-    def update_emission_params(self, lo_sigma: float, hi_sigma: float):
-        """
-        Called by AutoCalibrator to set emission means from live GARCH data.
-        lo_sigma = 33rd pct of rolling sigma  (LOW/MED boundary)
-        hi_sigma = 67th pct of rolling sigma  (MED/HIGH boundary)
-        State means spaced at: [lo/2,  (lo+hi)/2,  hi*1.5]
-        State stds  spaced at: [lo/4,  (hi-lo)/4,  hi/3 ]
-        """
-        mid = (lo_sigma + hi_sigma) / 2.0
-        self._MU  = np.array([lo_sigma / 2.0, mid, hi_sigma * 1.5])
-        self._STD = np.array([
-            max(lo_sigma / 4.0, 1e-5),
-            max((hi_sigma - lo_sigma) / 4.0, 1e-5),
-            max(hi_sigma / 3.0, 1e-5),
-        ])
-
-    def _emission(self, sigma: float) -> np.ndarray:
-        """Gaussian emission P(sigma | state=s) for each state."""
-        z   = (sigma - self._MU) / np.maximum(self._STD, 1e-9)
-        pdf = np.exp(-0.5 * z ** 2) / np.maximum(self._STD * (2.0 * np.pi) ** 0.5, 1e-9)
-        return np.maximum(pdf, 1e-300)
+    def _bucket(self, sigma: float) -> int:
+        if sigma < self._LO: return self.LOW
+        if sigma < self._HI: return self.MED
+        return self.HIGH
 
     def update(self, sigma: float) -> int:
-        """Scaled forward pass: alpha_t proportional to emission x A^T x alpha_{t-1}."""
-        emit        = self._emission(sigma)
-        predicted   = self._A.T @ self._alpha     # shape (3,)
-        new_alpha   = emit * predicted
-        s           = new_alpha.sum()
-        self._alpha = new_alpha / s if s > 1e-300 else np.ones(3) / 3.0
+        obs         = self._bucket(sigma)
+        new         = self._A[obs] * self._alpha
+        s           = new.sum()
+        self._alpha = new / s if s > 0 else np.ones(3) / 3
         self.state  = int(np.argmax(self._alpha))
         return self.state
 
@@ -509,7 +434,6 @@ class HMMRegimes:
 
     def name(self) -> str:
         return ["LOW", "MED", "HIGH"][self.state]
-
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -744,90 +668,44 @@ class MACDFilter:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# LAYER 10 — AWESOME OSCILLATOR  (OHLC bar-based, market energy)
+# LAYER 10 — AWESOME OSCILLATOR  (market energy / volume proxy)
 # ══════════════════════════════════════════════════════════════════════
-class OHLCBarBuilder:
-    """
-    FIX (Issue 5): Builds OHLC bars from raw tick data so the Awesome
-    Oscillator can compute midprice = (High + Low) / 2 per bar — its
-    canonical input — rather than raw spot prices.
-
-    Bar period is CFG["ao_bar_ticks"] ticks (default 5 ticks = 5 seconds
-    on RDBEAR, giving ~1-minute bars for the slow SMA(34) to span ~2.8 min).
-
-    Each completed bar exposes .open, .high, .low, .close, .midprice.
-    """
-    def __init__(self, bar_ticks: int = 5):
-        self._bar_ticks = bar_ticks
-        self._buf: list  = []
-        self.bars: deque = deque(maxlen=200)   # keep last 200 bars
-
-    def update(self, price: float):
-        self._buf.append(price)
-        if len(self._buf) >= self._bar_ticks:
-            o = self._buf[0]
-            h = max(self._buf)
-            l = min(self._buf)
-            c = self._buf[-1]
-            self.bars.append({
-                "open":     o,
-                "high":     h,
-                "low":      l,
-                "close":    c,
-                "midprice": (h + l) / 2.0,
-            })
-            self._buf = []
-
-    def midprices(self) -> np.ndarray:
-        return np.array([b["midprice"] for b in self.bars], dtype=float)
-
-    def n_bars(self) -> int:
-        return len(self.bars)
-
-
 class AwesomeOscillator:
     """
-    FIX (Issue 5): AO now operates on OHLC bar midprices: (H+L)/2.
-    This is the standard Bill Williams formulation and gives the AO
-    genuine meaning as a momentum/energy proxy:
+    AO = SMA(midprice, 5) - SMA(midprice, 34)
 
-        AO = SMA(midprice, 5 bars) - SMA(midprice, 34 bars)
+    For synthetic tick data (no OHLC), midprice = spot price.
+    Low |AO| → market energy is subdued → price more likely to stay
+    rangebound at the terminal tick → good for EXPIRYRANGE.
 
-    On RDBEAR with ao_bar_ticks=5, each bar = 5 ticks.
-    The slow SMA(34) spans 170 ticks (~2.8 min), the fast SMA(5) spans
-    25 ticks — a meaningful short-vs-long momentum comparison.
+    score():
+        1.0 → |AO| near zero (silent market)
+        0.0 → |AO| at or above veto threshold (active market)
 
-    The bar builder is owned by the bot and passed in at construction so
-    both AO and its calibrator share the same bar history.
+    veto():
+        True if |AO| > ao_veto_threshold
     """
 
-    def __init__(self, bar_builder: OHLCBarBuilder):
-        self._bars = bar_builder
+    def __init__(self):
+        self._fast = deque(maxlen=CFG["ao_fast_period"])
+        self._slow = deque(maxlen=CFG["ao_slow_period"])
         self._ao   = 0.0
 
-    def _compute(self) -> float:
-        mids = self._bars.midprices()
-        fp   = CFG["ao_fast_period"]   # bars
-        sp   = CFG["ao_slow_period"]   # bars
-        if len(mids) < sp:
-            return 0.0
-        return float(np.mean(mids[-fp:]) - np.mean(mids[-sp:]))
-
     def update(self, price: float):
-        """Called every tick; bar builder handles aggregation."""
-        self._bars.update(price)
-        if self._bars.n_bars() >= CFG["ao_slow_period"]:
-            self._ao = self._compute()
+        self._fast.append(price)
+        self._slow.append(price)
+        if len(self._fast) == CFG["ao_fast_period"] and len(self._slow) == CFG["ao_slow_period"]:
+            self._ao = float(np.mean(self._fast) - np.mean(self._slow))
 
     def is_ready(self) -> bool:
-        return self._bars.n_bars() >= CFG["ao_slow_period"]
+        return len(self._slow) == CFG["ao_slow_period"]
 
     def value(self) -> float:
         return self._ao
 
     def score(self) -> float:
         if not self.is_ready():
-            return 0.5
+            return 0.5   # neutral before warmup
         abs_ao = abs(self._ao)
         return float(np.clip(1.0 - abs_ao / CFG["ao_veto_threshold"], 0.0, 1.0))
 
@@ -835,7 +713,6 @@ class AwesomeOscillator:
         if not self.is_ready():
             return False
         return abs(self._ao) > CFG["ao_veto_threshold"]
-
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1076,9 +953,10 @@ class AutoCalibrator:
         lo_sig, hi_sig = self._calibrate_hmm_sigma(rets)
         CFG["hmm_lo_sigma"] = lo_sig
         CFG["hmm_hi_sigma"] = hi_sig
-        hmm.update_emission_params(lo_sig, hi_sig)  # FIX4: update Gaussian emission params
-        log.info(f"[CALIB]   hmm_lo_sigma (emission mu LOW)  → {lo_sig:.7f}")
-        log.info(f"[CALIB]   hmm_hi_sigma (emission mu HIGH) → {hi_sig:.7f}")
+        hmm._LO = lo_sig    # update the live HMM instance
+        hmm._HI = hi_sig
+        log.info(f"[CALIB]   hmm_lo_sigma        → {lo_sig:.7f}")
+        log.info(f"[CALIB]   hmm_hi_sigma        → {hi_sig:.7f}")
 
         # 6. GARCH 2-min cumulative sigma ceiling
         sigma_ceil = self._calibrate_garch_ceiling(rets)
@@ -1170,27 +1048,20 @@ class AutoCalibrator:
 
     def _calibrate_ao(self, prices: np.ndarray) -> float:
         """
-        FIX (Issue 5): Replay the AO over price history using the same
-        OHLC-bar / midprice basis as the live AwesomeOscillator, so the
-        veto threshold is on the correct scale. Previously this replayed
-        AO directly on raw ticks, which no longer matches how the live
-        AO (now bar-based) actually behaves — the threshold would have
-        been calibrated on a different scale and lost its effect.
-
-        Returns the calib_ao_percentile-th percentile of |AO| across bars.
+        Replay AO over price history; return the 85th-percentile
+        of |AO| as the veto threshold.
         """
-        fp = CFG["ao_fast_period"]   # bars
-        sp = CFG["ao_slow_period"]   # bars
-
-        bar_builder = OHLCBarBuilder(bar_ticks=CFG["ao_bar_ticks"])
-        for p in prices.astype(float):
-            bar_builder.update(p)
-
-        mids = bar_builder.midprices()
+        fast_p = CFG["ao_fast_period"]
+        slow_p = CFG["ao_slow_period"]
+        fast_q: deque = deque(maxlen=fast_p)
+        slow_q: deque = deque(maxlen=slow_p)
         aos: list = []
-        for i in range(sp, len(mids) + 1):
-            window = mids[:i]
-            aos.append(abs(float(np.mean(window[-fp:])) - float(np.mean(window[-sp:]))))
+
+        for p in prices.astype(float):
+            fast_q.append(p)
+            slow_q.append(p)
+            if len(fast_q) == fast_p and len(slow_q) == slow_p:
+                aos.append(abs(float(np.mean(fast_q)) - float(np.mean(slow_q))))
 
         if not aos:
             return CFG["ao_veto_threshold"]
@@ -1432,14 +1303,9 @@ class ExpiryRangeBot:
         self.bayes    = BayesianEdge()
         self.jump_fp  = JumpFirstPassage()
         self.macd     = MACDFilter()       # L9
-        # FIX (Issue 5): AO now runs on OHLC bars (not raw ticks). The bar
-        # builder is owned here and shared with the AutoCalibrator so the
-        # live AO and the calibrated ao_veto_threshold are on the same scale.
-        self.ao_bars  = OHLCBarBuilder(bar_ticks=CFG["ao_bar_ticks"])
-        self.ao       = AwesomeOscillator(self.ao_bars) # L10
-        self.guard      = RiskGuard()
-        self.ensemble   = Ensemble()
-        self.calibrator = AutoCalibrator()   # wired in — startup + loss triggers active
+        self.ao       = AwesomeOscillator() # L10
+        self.guard    = RiskGuard()
+        self.ensemble = Ensemble()
 
         # ── Price history ──
         self.ticks   = deque(maxlen=CFG["tick_buffer"])
@@ -1451,7 +1317,6 @@ class ExpiryRangeBot:
         self.active_id      = None
         self._buying        = False
         self._lock_since    = None
-        self._calib_done    = False   # gates trading until startup calibration completes
         self.trade_count    = 0
         self.wins           = 0
         self.total_pnl      = 0.0
@@ -1583,11 +1448,9 @@ class ExpiryRangeBot:
         Full 10-layer two-stage pipeline.
         Returns (should_trade, confidence, mc_lower_bound, signals, reason).
         """
-        if not self._calib_done:
-            rem = max(CFG["calib_min_ticks"] - len(self.ticks), 0)
-            if rem > 0:
-                return False, 0.0, 0.0, {}, f"AWAITING_CALIB({rem} ticks to threshold)"
-            return False, 0.0, 0.0, {}, "AWAITING_CALIB(calibration running)"
+        if len(self.ticks) < CFG["warmup_ticks"]:
+            rem = CFG["warmup_ticks"] - len(self.ticks)
+            return False, 0.0, 0.0, {}, f"WARMUP({rem} left)"
 
         prices = np.array(self.ticks,   dtype=float)
         rets   = np.array(self.returns, dtype=float) if self.returns else np.array([0.0])
@@ -1739,30 +1602,6 @@ class ExpiryRangeBot:
             else:
                 return
 
-        # ── Startup calibration gate ─────────────────────────────────
-        # Trading is blocked until the first calibration completes.
-        # Once calib_min_ticks ticks have accumulated, calibration runs
-        # once (marks _calib_done=True) and from the next tick onward
-        # the bot enters the normal trading path.
-        if not self._calib_done:
-            if self.calibrator.should_run_startup(len(self.ticks)):
-                prices  = np.array(self.ticks,   dtype=float)
-                returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
-                self.calibrator.run(
-                    tick_n  = self._tick_n,
-                    prices  = prices,
-                    returns = returns,
-                    hmm     = self.hmm,
-                    trigger = "startup",
-                )
-                self._calib_done = True
-                log.info("[CALIB] Startup calibration complete — trading now unlocked.")
-            else:
-                rem = max(CFG["calib_min_ticks"] - len(self.ticks), 0)
-                if self._tick_n % 60 == 0:
-                    log.info(f"[CALIB] Collecting ticks for startup calibration ({rem} remaining).")
-            return
-
         if not self.guard.can_trade():
             if self._tick_n % 30 == 0:
                 log.info(f"[GUARD] {self.guard.status()}")
@@ -1896,17 +1735,6 @@ class ExpiryRangeBot:
         else:
             self.guard.on_loss()
             tag = "LOSS"
-            # ── Loss-triggered recalibration ─────────────────────────
-            if self.calibrator.should_run_on_loss(self._tick_n, len(self.ticks)):
-                prices  = np.array(self.ticks,   dtype=float)
-                returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
-                self.calibrator.run(
-                    tick_n  = self._tick_n,
-                    prices  = prices,
-                    returns = returns,
-                    hmm     = self.hmm,
-                    trigger = "loss",
-                )
 
         wr     = self.wins / self.trade_count if self.trade_count else 0.0
         lo, hi = self.bayes.ci95()
@@ -1958,7 +1786,7 @@ class ExpiryRangeBot:
 
         await wsman.send_nowait({"ticks": CFG["symbol"], "subscribe": 1})
         wsman.state = ConnState.SUBSCRIBED
-        log.info(f"Subscribed to {CFG['symbol']} — collecting {CFG['calib_min_ticks']} ticks for startup calibration (~12 min).")
+        log.info(f"Subscribed to {CFG['symbol']} — warming up {CFG['warmup_ticks']} ticks.")
 
         if self.active_id:
             await wsman.send_nowait({
@@ -1982,7 +1810,7 @@ class ExpiryRangeBot:
     async def run(self):
         bar = "=" * 70
         log.info(bar)
-        log.info("  EXPIRYRANGE BOT v2  ·  RDBEAR  ·  ±1.80  ·  2-min")
+        log.info("  EXPIRYRANGE BOT v2  ·  1HZ10V  ·  ±1.80  ·  2-min")
         log.info("  10-Layer Intelligence: L1-GARCH L2-MC L3-HMM L4-Hurst")
         log.info("  L5-OU L6-Bayes L7-Guard L8-Jump L9-MACD L10-AO")
         log.info(f"  MC guarantee floor: {CFG['mc_guarantee_floor']} (lower CI bound)")
