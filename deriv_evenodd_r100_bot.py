@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (1HZ10V)          ║
-║  Symbol   : 1HZ10V  (Volatility 10 Index, 1-second ticks)           ║
+║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (RDBEAR)          ║
+║  Symbol   : RDBEAR  (Bear Market Index, 1-second ticks)              ║
 ║  Contract : EXPIRYRANGE  ("Ends Between" — terminal price only)      ║
 ║  Duration : 2 minutes  (120 ticks to terminal price)                 ║
 ║  Barriers : ±2.70 relative to entry spot  (auto-calibrated)         ║
@@ -120,7 +120,11 @@ CFG = {
     "payout_ratio":                   0.5143,  # 0.18 profit / 0.35 stake
 
     # ── Signal accuracy gates ──
-    "warmup_ticks":       800,
+    # warmup_ticks is no longer the trading gate — that role is now owned by
+    # the startup calibration (calib_min_ticks=720).  This value is kept for
+    # model-buffer documentation only, aligned to calib_min_ticks so every
+    # model always has at least 720 ticks of data when it first runs.
+    "warmup_ticks":       720,
     "signal_interval":    5,
     "stage1_mc_n":        10_000,
     "stage2_mc_n":        50_000,
@@ -749,7 +753,7 @@ class OHLCBarBuilder:
     canonical input — rather than raw spot prices.
 
     Bar period is CFG["ao_bar_ticks"] ticks (default 5 ticks = 5 seconds
-    on 1HZ10V, giving ~1-minute bars for the slow SMA(34) to span ~2.8 min).
+    on RDBEAR, giving ~1-minute bars for the slow SMA(34) to span ~2.8 min).
 
     Each completed bar exposes .open, .high, .low, .close, .midprice.
     """
@@ -789,7 +793,7 @@ class AwesomeOscillator:
 
         AO = SMA(midprice, 5 bars) - SMA(midprice, 34 bars)
 
-    On 1HZ10V with ao_bar_ticks=5, each bar = 5 ticks.
+    On RDBEAR with ao_bar_ticks=5, each bar = 5 ticks.
     The slow SMA(34) spans 170 ticks (~2.8 min), the fast SMA(5) spans
     25 ticks — a meaningful short-vs-long momentum comparison.
 
@@ -1433,8 +1437,9 @@ class ExpiryRangeBot:
         # live AO and the calibrated ao_veto_threshold are on the same scale.
         self.ao_bars  = OHLCBarBuilder(bar_ticks=CFG["ao_bar_ticks"])
         self.ao       = AwesomeOscillator(self.ao_bars) # L10
-        self.guard    = RiskGuard()
-        self.ensemble = Ensemble()
+        self.guard      = RiskGuard()
+        self.ensemble   = Ensemble()
+        self.calibrator = AutoCalibrator()   # wired in — startup + loss triggers active
 
         # ── Price history ──
         self.ticks   = deque(maxlen=CFG["tick_buffer"])
@@ -1446,6 +1451,7 @@ class ExpiryRangeBot:
         self.active_id      = None
         self._buying        = False
         self._lock_since    = None
+        self._calib_done    = False   # gates trading until startup calibration completes
         self.trade_count    = 0
         self.wins           = 0
         self.total_pnl      = 0.0
@@ -1577,9 +1583,11 @@ class ExpiryRangeBot:
         Full 10-layer two-stage pipeline.
         Returns (should_trade, confidence, mc_lower_bound, signals, reason).
         """
-        if len(self.ticks) < CFG["warmup_ticks"]:
-            rem = CFG["warmup_ticks"] - len(self.ticks)
-            return False, 0.0, 0.0, {}, f"WARMUP({rem} left)"
+        if not self._calib_done:
+            rem = max(CFG["calib_min_ticks"] - len(self.ticks), 0)
+            if rem > 0:
+                return False, 0.0, 0.0, {}, f"AWAITING_CALIB({rem} ticks to threshold)"
+            return False, 0.0, 0.0, {}, "AWAITING_CALIB(calibration running)"
 
         prices = np.array(self.ticks,   dtype=float)
         rets   = np.array(self.returns, dtype=float) if self.returns else np.array([0.0])
@@ -1731,6 +1739,30 @@ class ExpiryRangeBot:
             else:
                 return
 
+        # ── Startup calibration gate ─────────────────────────────────
+        # Trading is blocked until the first calibration completes.
+        # Once calib_min_ticks ticks have accumulated, calibration runs
+        # once (marks _calib_done=True) and from the next tick onward
+        # the bot enters the normal trading path.
+        if not self._calib_done:
+            if self.calibrator.should_run_startup(len(self.ticks)):
+                prices  = np.array(self.ticks,   dtype=float)
+                returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
+                self.calibrator.run(
+                    tick_n  = self._tick_n,
+                    prices  = prices,
+                    returns = returns,
+                    hmm     = self.hmm,
+                    trigger = "startup",
+                )
+                self._calib_done = True
+                log.info("[CALIB] Startup calibration complete — trading now unlocked.")
+            else:
+                rem = max(CFG["calib_min_ticks"] - len(self.ticks), 0)
+                if self._tick_n % 60 == 0:
+                    log.info(f"[CALIB] Collecting ticks for startup calibration ({rem} remaining).")
+            return
+
         if not self.guard.can_trade():
             if self._tick_n % 30 == 0:
                 log.info(f"[GUARD] {self.guard.status()}")
@@ -1864,6 +1896,17 @@ class ExpiryRangeBot:
         else:
             self.guard.on_loss()
             tag = "LOSS"
+            # ── Loss-triggered recalibration ─────────────────────────
+            if self.calibrator.should_run_on_loss(self._tick_n, len(self.ticks)):
+                prices  = np.array(self.ticks,   dtype=float)
+                returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
+                self.calibrator.run(
+                    tick_n  = self._tick_n,
+                    prices  = prices,
+                    returns = returns,
+                    hmm     = self.hmm,
+                    trigger = "loss",
+                )
 
         wr     = self.wins / self.trade_count if self.trade_count else 0.0
         lo, hi = self.bayes.ci95()
@@ -1915,7 +1958,7 @@ class ExpiryRangeBot:
 
         await wsman.send_nowait({"ticks": CFG["symbol"], "subscribe": 1})
         wsman.state = ConnState.SUBSCRIBED
-        log.info(f"Subscribed to {CFG['symbol']} — warming up {CFG['warmup_ticks']} ticks.")
+        log.info(f"Subscribed to {CFG['symbol']} — collecting {CFG['calib_min_ticks']} ticks for startup calibration (~12 min).")
 
         if self.active_id:
             await wsman.send_nowait({
@@ -1939,7 +1982,7 @@ class ExpiryRangeBot:
     async def run(self):
         bar = "=" * 70
         log.info(bar)
-        log.info("  EXPIRYRANGE BOT v2  ·  1HZ10V  ·  ±1.80  ·  2-min")
+        log.info("  EXPIRYRANGE BOT v2  ·  RDBEAR  ·  ±1.80  ·  2-min")
         log.info("  10-Layer Intelligence: L1-GARCH L2-MC L3-HMM L4-Hurst")
         log.info("  L5-OU L6-Bayes L7-Guard L8-Jump L9-MACD L10-AO")
         log.info(f"  MC guarantee floor: {CFG['mc_guarantee_floor']} (lower CI bound)")
