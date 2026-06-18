@@ -136,8 +136,11 @@ CFG = {
     "mc_guarantee_floor": 0.62,
 
     # ── HMM regime thresholds ──
-    # LOW vol → 0.77, MED vol → 0.78, HIGH vol → veto
-    "regime_threshold": {0: 0.77, 1: 0.78, 2: None},
+    # LOW vol → 0.72, MED vol → 0.74, HIGH vol → veto
+    # Lowered from 0.77/0.78 to increase signal frequency toward 8-15
+    # high-confidence trades/hour. Ensemble floor gates and the Wilson
+    # lower-bound barrier calibration still guard accuracy.
+    "regime_threshold": {0: 0.72, 1: 0.74, 2: None},
 
     # ── HMM sigma bucket thresholds (sigma_t scale; calibrated, auto-updated) ──
     "hmm_lo_sigma": 0.2900193,
@@ -520,24 +523,48 @@ class HMMRegimes:
 class HurstAnalyzer:
     @staticmethod
     def compute(prices: np.ndarray) -> float:
+        """
+        FIX (Hurst R/S bug): the previous implementation built `c =
+        prices[:lag]` inside the loop — i.e. it always re-sliced from the
+        START of the array as lag grew, rather than computing R/S over
+        independent sub-windows. That's not a valid rescaled-range
+        estimate; it structurally biased H toward the 0.95 ceiling on
+        almost every tick (confirmed in live logs: 82% of readings
+        rounded to 0.9, mean 0.90), which in turn wildly over-inflated
+        the Hurst-scaled GARCH cumulative-variance forecast and caused
+        GARCH_EXTREME_VOL_VETO to fire on ~77% of all evaluated ticks.
+
+        This is the standard R/S method: for each window length (lag),
+        split the series into non-overlapping chunks of that length,
+        compute R/S per chunk, average across chunks, then regress
+        log(avg R/S) against log(lag) across multiple lags.
+        """
+        prices = np.asarray(prices, dtype=float)
         n = len(prices)
         if n < 20:
             return 0.5
-        max_lag = max(5, n // 4)
-        lags, rs = [], []
+        max_lag = max(8, n // 4)
+        lags, rs_avg = [], []
         for lag in range(4, max_lag):
-            c = prices[:lag].astype(float)
-            m = c.mean()
-            d = np.cumsum(c - m)
-            r = d.max() - d.min()
-            s = c.std(ddof=1)
-            if s > 0:
+            n_chunks = n // lag
+            if n_chunks < 1:
+                continue
+            rs_vals = []
+            for i in range(n_chunks):
+                c = prices[i * lag:(i + 1) * lag]
+                m = c.mean()
+                d = np.cumsum(c - m)
+                r = d.max() - d.min()
+                s = c.std(ddof=1)
+                if s > 0:
+                    rs_vals.append(r / s)
+            if rs_vals:
                 lags.append(lag)
-                rs.append(r / s)
-        if len(rs) < 4:
+                rs_avg.append(float(np.mean(rs_vals)))
+        if len(rs_avg) < 4:
             return 0.5
         try:
-            h, _ = np.polyfit(np.log(lags), np.log(rs), 1)
+            h, _ = np.polyfit(np.log(lags), np.log(rs_avg), 1)
             return float(np.clip(h, 0.05, 0.95))
         except Exception:
             return 0.5
@@ -1104,42 +1131,64 @@ class AutoCalibrator:
 
     def _calibrate_barrier(self, prices: np.ndarray) -> float:
         """
-        Walk-forward evaluation of terminal win-rate per candidate barrier.
-        Steps through history in non-overlapping n_contract_ticks windows,
-        measures |terminal_price - entry| < barrier.
-        Picks the *smallest* candidate that achieves calib_target_win_rate.
-        Falls back to current CFG barrier (2.70) if none qualify.
+        Overlapping (rolling) window barrier calibration with Wilson
+        lower confidence bound selection.
+
+        Replaces the non-overlapping walk-forward approach which yielded
+        only ~6 samples at 720 ticks (SE ~0.20, barrier swings ±0.80).
+        Rolling stride-1 windows yield ~600 samples (SE ~0.02), making
+        the calibrated barrier stable to ±0.05 between runs.
+
+        Selection criterion: Wilson 95% lower confidence bound >= target,
+        not the point estimate. Prevents a lucky 6-sample draw from
+        committing to a barrier that hasn't earned it statistically.
+
+        Wilson lower bound:
+            z    = 1.96
+            p̂   = wins / n
+            lb   = (p̂ + z²/2n - z·√(p̂(1-p̂)/n + z²/4n²)) / (1 + z²/n)
+
+        Picks the *smallest* barrier where lb >= calib_target_win_rate.
+        Falls back to current CFG barrier if none qualify.
         """
         n_ticks    = CFG["n_contract_ticks"]           # 120
         candidates = sorted(CFG["calib_barrier_candidates"])
         target_wr  = CFG["calib_target_win_rate"]
         prices     = prices.astype(float)
+        z          = 1.96                               # 95% CI
 
-        if len(prices) < n_ticks * 2:
+        if len(prices) < n_ticks + 1:
             return self._barrier_float()
 
-        # Build walk-forward results
-        wins_by_b: dict = {b: [] for b in candidates}
-        i = 0
-        while i + n_ticks < len(prices):
-            entry    = prices[i]
-            terminal = prices[i + n_ticks]
-            move     = abs(terminal - entry)
-            for b in candidates:
-                wins_by_b[b].append(1 if move < b else 0)
-            i += n_ticks   # non-overlapping windows
+        # Rolling windows: entry at index i, terminal at i + n_ticks
+        # Vectorised — no Python loop over ticks
+        entries   = prices[:-n_ticks]
+        terminals = prices[n_ticks:]
+        moves     = np.abs(terminals - entries)         # shape: (N,)
+        n_samples = len(moves)
 
-        # Pick smallest qualifying barrier
         best = self._barrier_float()
         for b in candidates:
-            results = wins_by_b[b]
-            if not results:
-                continue
-            wr = sum(results) / len(results)
-            log.info(f"[CALIB]     barrier={b:.2f}  win_rate={wr:.3f}  samples={len(results)}")
-            if wr >= target_wr:
+            wins  = int(np.sum(moves < b))
+            p_hat = wins / n_samples
+
+            # Wilson lower bound
+            lb = (
+                (p_hat + z**2 / (2 * n_samples)
+                 - z * np.sqrt(p_hat * (1 - p_hat) / n_samples
+                               + z**2 / (4 * n_samples**2)))
+                / (1 + z**2 / n_samples)
+            )
+
+            log.info(
+                f"[CALIB]     barrier={b:.2f}  "
+                f"win_rate={p_hat:.3f}  lb95={lb:.3f}  "
+                f"samples={n_samples}"
+            )
+
+            if lb >= target_wr:
                 best = b
-                break   # smallest that qualifies
+                break   # smallest that qualifies on lower bound
 
         return best
 
@@ -1240,12 +1289,23 @@ class AutoCalibrator:
         """
         Replay GARCH(1,1) over returns.  Compute the 2-min cumulative
         σ at each tick; return the 99th-percentile as the extreme-vol ceiling.
+
+        FIX: this replay previously called forecast_cumulative_std()
+        without a hurst= argument, silently defaulting to hurst=0.5 —
+        a flat, unscaled assumption that didn't match how live trading
+        actually computes sigma_2min (using the real rolling Hurst
+        value). That mismatch meant the calibrated ceiling was on a
+        different scale than what live trading was vetoing against.
+        Now mirrors the live 100-tick rolling Hurst window exactly.
         """
-        g      = GARCH11()
-        s2mins = []
-        for r in rets:
+        g       = GARCH11()
+        hurst_a = HurstAnalyzer()
+        s2mins  = []
+        for i, r in enumerate(rets):
             g.update(float(r))
-            s2mins.append(g.forecast_cumulative_std(CFG["n_contract_ticks"]))
+            h_window = rets[max(0, i - 99): i + 1]
+            h_val    = hurst_a.compute(h_window) if len(h_window) >= 20 else 0.5
+            s2mins.append(g.forecast_cumulative_std(CFG["n_contract_ticks"], hurst=h_val))
 
         if not s2mins:
             return CFG["garch_sigma_ceiling"]
@@ -1513,8 +1573,15 @@ class ExpiryRangeBot:
         r_now   = float(rets[-1]) if len(rets) > 0 else 0.0
         sigma_t = self.garch.update(r_now)
 
-        window    = prices[-60:] if len(prices) >= 60 else prices
-        h_val     = self.hurst_a.compute(window)
+        # FIX (Hurst input bug): R/S analysis must be computed on RETURNS,
+        # not price LEVELS. Price levels are themselves already a
+        # cumulative/integrated process, so running R/S on them adds an
+        # extra order of integration and pushes H toward 1.0 regardless
+        # of the windowing fix above. Widened to 100 ticks (vs. the
+        # previous 60) to reduce the small-sample upward bias inherent
+        # to the simple R/S estimator.
+        hurst_window = rets[-100:] if len(rets) >= 100 else rets
+        h_val     = self.hurst_a.compute(hurst_window)
         hurst_sig = self.hurst_a.signal(h_val)
 
         sigma_2min = self.garch.forecast_cumulative_std(CFG["n_contract_ticks"], hurst=h_val)
@@ -1613,7 +1680,7 @@ class ExpiryRangeBot:
         if self.hmm.is_high_vol():
             self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="HMM_HIGH_VOL_VETO")
             return False, s["pre_score"], 0.0, s, "HMM_HIGH_VOL_VETO"
-        if self.garch.is_extreme(s["sigma_2min"]):
+        if self.garch.is_extreme(s["sigma_2min"], ceiling=CFG["garch_sigma_ceiling"]):
             self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="GARCH_EXTREME_VOL_VETO")
             return False, s["pre_score"], 0.0, s, "GARCH_EXTREME_VOL_VETO"
         if s["jump_veto"]:
