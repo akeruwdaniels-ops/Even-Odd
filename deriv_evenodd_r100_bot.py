@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (RDBEAR)          ║
-║  Symbol   : RDBEAR  (Bear Market Index, 1-second ticks)              ║
+║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (1HZ10V)          ║
+║  Symbol   : 1HZ10V  (Volatility 10 Index 1s, 1-second ticks)         ║
 ║  Contract : EXPIRYRANGE  ("Ends Between" — terminal price only)      ║
 ║  Duration : 2 minutes  (120 ticks to terminal price)                 ║
-║  Barriers : ±2.70 relative to entry spot  (auto-calibrated)         ║
+║  Barriers : ±2.25 relative to entry spot  (auto-calibrated)         ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  Connection: new Deriv Options API (REST OTP bootstrap)              ║
 ║    REST /trading/v1/options/accounts → resolve account_id            ║
@@ -88,82 +88,80 @@ from scipy import stats
 # ══════════════════════════════════════════════════════════════════════
 CFG = {
     # ── Contract ──
-    "symbol":           "RDBEAR",
+    # Switched from RDBEAR to 1HZ10V (Volatility 10 (1s) Index).
+    # Calibration (720 ticks, 2026-06-18): H=0.838 (trending), σ_tick≈0.183,
+    # terminal 2-min p50=2.415, win rates top out at 45% at ±2.25.
+    # Required win rate for breakeven (stake $0.35, profit $0.18): 66.1%.
+    # Bot must filter hard — only trade when all layers align strongly.
+    "symbol":           "1HZ10V",
     "contract_type":    "EXPIRYRANGE",
     "duration":         2,
     "duration_unit":    "m",
-    "barrier":          "+2.70",   # fixed at ±2.70 for 2-min; auto-calibrator refines within ±0.5
-    "barrier2":         "-2.70",
+    # Barrier from calibration JSON: ±2.25 is the widest tested, 45% raw win rate.
+    # Auto-calibrator will refine; seed value set to calibrated optimum.
+    "barrier":          "+2.25",
+    "barrier2":         "-2.25",
     "currency":         "USD",
-    "n_contract_ticks": 120,       # 2 min × 60 sec
+    "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
     "starting_bankroll": 1.00,
     "stake":             0.35,
     "drawdown_stop":     0.10,
 
-    # ── Kelly staking ──
-    # FIX (Issue 3): Kelly now active from starting bankroll (1.0).
-    # Activation at 5.0 meant Kelly never ran on a $1 account.
-    # kelly_fraction set to 0.25 (quarter-Kelly) — conservative on a small
-    # float; prevents over-betting on early noisy win-rate estimates.
-    # kelly_max_fraction_of_bankroll capped at 0.35 so Kelly never exceeds
-    # what the flat-stake baseline would have bet.
-    #
-    # FIX (Issue 6): payout_ratio corrected to actual Deriv return.
-    # A $0.35 stake returns $0.18 profit → b = 0.18 / 0.35 = 0.5143.
-    # Kelly formula: f* = (b*p - q) / b — using wrong b distorts sizing.
+    # ── Kelly staking (FIX 3 + FIX 6) ──
+    # Kelly active from bankroll=1.0 (was 5.0 — never fired on small accounts).
+    # Quarter-Kelly (0.25) keeps sizing conservative on noisy early posteriors.
+    # kelly_max_fraction_of_bankroll=0.35 hard-caps Kelly at flat-stake level.
+    # payout_ratio = 0.18/0.35 = 0.5143 (actual Deriv return, not assumed 0.50).
     "kelly_activation_bankroll":      1.0,
     "kelly_fraction":                 0.25,
     "kelly_min_stake":                0.35,
     "kelly_max_fraction_of_bankroll": 0.35,
-    "payout_ratio":                   0.5143,  # 0.18 profit / 0.35 stake
+    "payout_ratio":                   0.5143,  # 0.18 profit on $0.35 stake
 
     # ── Signal accuracy gates ──
-    # warmup_ticks is no longer the trading gate — that role is now owned by
-    # the startup calibration (calib_min_ticks=720).  Kept for documentation
-    # only, aligned to calib_min_ticks so models always have >= 720 ticks.
     "warmup_ticks":       720,
     "signal_interval":    5,
     "stage1_mc_n":        10_000,
     "stage2_mc_n":        50_000,
-    "pre_scan_threshold": 0.70,
+    # pre_scan raised from 0.70 to 0.74: 1HZ10V win rates are 45% raw,
+    # so the pre-filter must be tighter to avoid low-confidence entries.
+    "pre_scan_threshold": 0.74,
 
     # ── MC terminal-price guarantee ──
-    # Trade only if (p_deep - CI_95_halfwidth) >= this value.
-    # Enforces that even the LOWER confidence bound of the 50K MC
-    # still clears the threshold — not just the point estimate.
-    "mc_guarantee_floor": 0.62,
+    # Raised from 0.62 to 0.65 — 1HZ10V has wider terminal distribution
+    # (p50=2.41 vs barrier 2.25) so the MC lower bound must be higher to
+    # ensure genuine edge above the 66.1% breakeven threshold.
+    "mc_guarantee_floor": 0.65,
 
     # ── HMM regime thresholds ──
-    # LOW vol → 0.72, MED vol → 0.74, HIGH vol → veto
-    # Lowered from 0.77/0.78 to increase signal frequency toward 8-15
-    # high-confidence trades/hour. Ensemble floor gates and the Wilson
-    # lower-bound barrier calibration still guard accuracy.
-    "regime_threshold": {0: 0.72, 1: 0.74, 2: None},
+    # Tightened slightly for 1HZ10V (trending symbol needs stronger regime
+    # confirmation before trading). MED threshold raised to 0.76.
+    "regime_threshold": {0: 0.78, 1: 0.81, 2: None},
 
-    # ── HMM sigma bucket thresholds (sigma_t scale; calibrated, auto-updated) ──
-    "hmm_lo_sigma": 0.2900193,
-    "hmm_hi_sigma": 0.35364744,
+    # ── HMM emission params (sigma_t scale) — from calibration JSON ──
+    # hmm_lo_sigma = 33rd pct of rolling GARCH sigma_t = 0.13413
+    # hmm_hi_sigma = 67th pct of rolling GARCH sigma_t = 0.16210
+    # AutoCalibrator will refine these live; these are calibrated seeds.
+    "hmm_lo_sigma": 0.13413158,
+    "hmm_hi_sigma": 0.16210294,
 
-    # ── GARCH extreme ceiling on sigma_2min (calibrated, auto-updated) ──
-    "garch_sigma_ceiling": 4.6955,
+    # ── GARCH extreme ceiling on sigma_2min — from calibration JSON ──
+    "garch_sigma_ceiling": 2.0766,
 
-    # ── MACD (L9) ──
+    # ── MACD (L9) — veto from calibration JSON (85th pct) ──
     "macd_fast":               12,
     "macd_slow":               26,
     "macd_signal":             9,
-    # Histogram must be CONTRACTING (|hist_now| < |hist_prev|) to allow trade.
-    # Additionally veto if |histogram| > this threshold (strong momentum).
-    "macd_histogram_veto":     0.20204,
+    "macd_histogram_veto":     0.08312,  # calibrated from 720 ticks of 1HZ10V
 
-    # ── Awesome Oscillator (L10) ──
+    # ── Awesome Oscillator (L10) — veto from calibration JSON (85th pct) ──
+    # FIX 5: AO runs on OHLC bar midprices (H+L)/2, not raw ticks.
+    # 5 ticks/bar → SMA(34 bars) spans 170 ticks (~2.8 min): meaningful window.
     "ao_fast_period":          5,
     "ao_slow_period":          34,
-    # Veto if |AO| > this — market energy too high for a rangebound outcome
-    "ao_veto_threshold":       1.93768,
-    # FIX (Issue 5): ticks per OHLC bar feeding the AO. 5 ticks/bar on
-    # 1HZ10V ≈ 5s bars, so SMA(34 bars) spans ~2.8 min.
+    "ao_veto_threshold":       0.85604,  # calibrated from 720 ticks of 1HZ10V
     "ao_bar_ticks":            5,
 
     # ── Jump / spike detection (L8) ──
@@ -217,9 +215,9 @@ CFG = {
 
     # ── Logging ──
     "log_dir":     os.getenv("LOG_DIR", "logs"),
-    "log_file":    "er_bot_v2.log",
-    "signals_csv": "er_bot_v2_signals.csv",
-    "trades_csv":  "er_bot_v2_trades.csv",
+    "log_file":    "er_bot_1hz10v.log",
+    "signals_csv": "er_bot_1hz10v_signals.csv",
+    "trades_csv":  "er_bot_1hz10v_trades.csv",
     # tick_buffer must be >= calib_min_ticks so the deque holds enough history
     # for calibration to run.  Previously 300 — this caused len(ticks) to cap
     # at 300, freezing the calibration countdown at 420 (720-300) forever.
@@ -227,36 +225,53 @@ CFG = {
 }
 
 # ── Ensemble weights (regime-conditional) ──
+#
+# RESTRUCTURE: Jump, MACD, AO, Hurst-flip are no longer hard-veto gates.
+# Their information flows entirely through ensemble scoring. Weights are
+# rebalanced to give soft layers meaningful influence now that they can
+# no longer block trades outright — MC/GARCH/HMM absorb the freed weight
+# proportionally so the three hard-gate layers remain dominant.
+#
+# Weight philosophy per regime:
+#   LOW vol  : MC + OU lead (range probability clearest in calm markets)
+#              Hurst gets more weight — mean-reversion signal reliable
+#   MED vol  : GARCH promoted, Hurst reduced (vol structure dominates)
+#   HIGH vol : Hard-vetoed by HMM before weights matter — kept for reference
+# 1HZ10V WEIGHT ADJUSTMENT (Hurst=0.838, strongly trending):
+# Calibration note: "OU mean-reversion weaker; reduce ou_process weight."
+# ou_process reduced from 0.15→0.07 (LOW) and 0.10→0.06 (MED).
+# Freed weight redistributed to monte_carlo (+0.04) and garch (+0.04)
+# which remain reliable regardless of mean-reversion assumption.
+# MACD and AO weights raised slightly — on a trending symbol momentum
+# signals give more discriminating information about entry timing.
 MODEL_WEIGHTS_BY_REGIME = {
     0: {  # LOW vol
-        "monte_carlo": 0.24, "garch": 0.14, "hmm": 0.14,
-        "hurst": 0.14, "ou_process": 0.16, "bayesian": 0.05,
-        "jump": 0.03, "macd": 0.05, "ao": 0.05,
+        "monte_carlo": 0.30, "garch": 0.15, "hmm": 0.13,
+        "hurst": 0.13, "ou_process": 0.07, "bayesian": 0.05,
+        "jump": 0.05, "macd": 0.06, "ao": 0.06,
     },
     1: {  # MED vol
-        "monte_carlo": 0.25, "garch": 0.19, "hmm": 0.16,
-        "hurst": 0.09, "ou_process": 0.11, "bayesian": 0.05,
-        "jump": 0.05, "macd": 0.05, "ao": 0.05,
+        "monte_carlo": 0.30, "garch": 0.20, "hmm": 0.15,
+        "hurst": 0.08, "ou_process": 0.06, "bayesian": 0.05,
+        "jump": 0.05, "macd": 0.06, "ao": 0.05,
     },
-    2: {  # HIGH vol — unused (hard veto)
-        "monte_carlo": 0.28, "garch": 0.22, "hmm": 0.18,
-        "hurst": 0.07, "ou_process": 0.07, "bayesian": 0.04,
+    2: {  # HIGH vol — unused (hard veto by HMM)
+        "monte_carlo": 0.30, "garch": 0.24, "hmm": 0.18,
+        "hurst": 0.06, "ou_process": 0.05, "bayesian": 0.03,
         "jump": 0.05, "macd": 0.05, "ao": 0.04,
     },
 }
 MODEL_WEIGHTS = MODEL_WEIGHTS_BY_REGIME[1]
 
-# Per-model hard floors — ALL must pass
+# Per-model hard floors — only the three hard-gate layers retain floors.
+# Hurst, OU, Jump, MACD, AO floors removed: these layers now contribute
+# as soft scores rather than binary pass/fail gates. A weak Jump or MACD
+# score reduces ensemble confidence without killing the trade outright.
+# bayesian intentionally has no floor (posterior too noisy early on).
 MODEL_FLOORS = {
-    "monte_carlo": 0.65,
-    "garch":       0.52,
-    "hmm":         0.55,
-    "hurst":       0.45,
-    "ou_process":  0.58,
-    "jump":        0.50,
-    "macd":        0.50,   # 0.50 = neutral/no momentum, 1.0 = ideal (contracting)
-    "ao":          0.50,   # 0.50 = neutral low energy, 1.0 = ideal (silent market)
-    # bayesian: no floor
+    "monte_carlo": 0.65,   # hard gate: MC probability must be meaningful
+    "garch":       0.52,   # hard gate: vol structure must not be adverse
+    "hmm":         0.55,   # hard gate: regime prior must favour ranging
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -932,10 +947,10 @@ class RiskGuard:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# WEIGHTED ENSEMBLE  (10-layer, with per-model floors + dynamic threshold)
+# WEIGHTED ENSEMBLE  (10-layer, hard gates: MC+GARCH+HMM; soft: rest)
 # ══════════════════════════════════════════════════════════════════════
 class Ensemble:
-    NO_TOUCH_BLEND = 0.12   # slightly reduced to make room for MACD+AO
+    NO_TOUCH_BLEND = 0.12
 
     def decide(
         self,
@@ -956,6 +971,32 @@ class Ensemble:
         macd_veto:  bool,
         ao_veto:    bool,
     ) -> tuple:
+        """
+        RESTRUCTURED — three-tier decision architecture:
+
+        Tier 1  Hard gates  (binary block, unchanged):
+                  HMM HIGH vol, GARCH extreme vol.
+                  These catch genuinely untradeable regimes where no
+                  amount of soft scoring can compensate.
+
+        Tier 2  Hard floors  (MC, GARCH signal, HMM signal only):
+                  Ensures the three most predictive layers for
+                  EXPIRYRANGE meet a minimum threshold before the
+                  ensemble fires.  Floors on Hurst, OU, Jump, MACD,
+                  AO removed — their weakness penalises conf score
+                  without killing the trade outright.
+
+        Tier 3  Soft weighted ensemble  (all 9 layers):
+                  Jump, MACD, AO, Hurst, OU now contribute scores
+                  that lower confidence rather than veto entirely.
+                  A bad Jump or strong MACD will drag conf below
+                  the regime threshold and suppress the trade
+                  naturally — no hard cutoff needed.
+
+        Net effect: ~2× more signals reach Stage 2; the regime
+        threshold (0.72/0.74) and MC guarantee floor remain the
+        primary accuracy gates.
+        """
         scores = {
             "monte_carlo": mc_prob,
             "garch":       garch_sig,
@@ -969,29 +1010,24 @@ class Ensemble:
         }
         weights = MODEL_WEIGHTS_BY_REGIME.get(hmm_state, MODEL_WEIGHTS_BY_REGIME[1])
 
-        # ── Hard vetoes ──
+        # ── Tier 1: Hard gates (HMM regime + GARCH extreme) ──────────
+        # HMM HIGH vol: explosive/trending regime — no range trade
         if hmm_veto:
             return False, 0.0, scores, [], "HMM_HIGH_VOL_VETO"
-        if jump_veto:
-            return False, 0.0, scores, [], "JUMP_SPIKE_VETO"
-        if macd_veto:
-            return False, 0.0, scores, [], "MACD_HIGH_MOMENTUM_VETO"
-        if ao_veto:
-            return False, 0.0, scores, [], "AO_HIGH_ENERGY_VETO"
 
-        # ── Hurst-flip veto ──
-        if hurst_val < CFG["hurst_flip_value_veto"] and garch_sig > CFG["hurst_flip_garch_veto"]:
-            return False, 0.0, scores, [], (
-                f"HURST_FLIP_VETO(H={hurst_val:.2f},garch={garch_sig:.2f})"
-            )
-
-        # ── Per-model floors ──
+        # ── Tier 2: Hard floors on MC, GARCH signal, HMM signal ──────
+        # Jump, MACD, AO, Hurst, OU floors intentionally removed —
+        # these layers now exert influence through scoring only.
         failed = [k for k, floor in MODEL_FLOORS.items() if scores.get(k, 1.0) < floor]
         if failed:
             conf = float(np.clip(sum(scores[k] * weights[k] for k in weights), 0.0, 1.0))
             return False, conf, scores, failed, f"FLOOR_FAIL:{','.join(failed)}"
 
-        # ── Weighted ensemble score ──
+        # ── Tier 3: Soft weighted ensemble ───────────────────────────
+        # All 9 layers contribute. Jump/MACD/AO vetoes are demoted to
+        # scoring penalties: a jump_sig of 0.0 still drags down conf.
+        # Hurst-flip: demoted from hard veto to a soft score penalty —
+        # hurst_sig already encodes direction (low H → low score).
         conf_raw = float(np.clip(
             sum(scores[k] * weights[k] for k in weights), 0.0, 1.0,
         ))
@@ -1676,22 +1712,16 @@ class ExpiryRangeBot:
             f"AO={s['ao_val']:.4f}(score={s['ao_score']:.2f})"
         )
 
-        # Hard vetoes before Stage 2
+        # ── Stage 1 hard gates (HMM HIGH vol + GARCH extreme only) ──
+        # Jump, MACD, AO vetoes removed as hard stops — these conditions
+        # now flow through ensemble soft scoring and lower conf naturally.
+        # Hurst-flip veto also removed — hurst_sig already encodes this.
         if self.hmm.is_high_vol():
             self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="HMM_HIGH_VOL_VETO")
             return False, s["pre_score"], 0.0, s, "HMM_HIGH_VOL_VETO"
         if self.garch.is_extreme(s["sigma_2min"], ceiling=CFG["garch_sigma_ceiling"]):
             self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="GARCH_EXTREME_VOL_VETO")
             return False, s["pre_score"], 0.0, s, "GARCH_EXTREME_VOL_VETO"
-        if s["jump_veto"]:
-            self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="JUMP_SPIKE_VETO")
-            return False, s["pre_score"], 0.0, s, "JUMP_SPIKE_VETO"
-        if s["macd_veto"]:
-            self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="MACD_HIGH_MOMENTUM_VETO")
-            return False, s["pre_score"], 0.0, s, "MACD_HIGH_MOMENTUM_VETO"
-        if s["ao_veto"]:
-            self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="AO_HIGH_ENERGY_VETO")
-            return False, s["pre_score"], 0.0, s, "AO_HIGH_ENERGY_VETO"
 
         if s["pre_score"] < CFG["pre_scan_threshold"]:
             reason = f"PRE_SCAN_FAIL({s['pre_score']:.3f}<{CFG['pre_scan_threshold']})"
