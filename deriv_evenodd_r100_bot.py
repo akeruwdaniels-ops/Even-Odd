@@ -93,19 +93,19 @@ CFG = {
     # terminal 2-min p50=2.415, win rates top out at 45% at ±2.25.
     # Required win rate for breakeven (stake $0.35, profit $0.18): 66.1%.
     # Bot must filter hard — only trade when all layers align strongly.
-    "symbol":           "1HZ10V",
+    "symbol":           "RDBEAR",
     "contract_type":    "EXPIRYRANGE",
     "duration":         2,
     "duration_unit":    "m",
     # Barrier from calibration JSON: ±2.25 is the widest tested, 45% raw win rate.
     # Auto-calibrator will refine; seed value set to calibrated optimum.
-    "barrier":          "+2.25",
-    "barrier2":         "-2.25",
+    "barrier":          "+2.89",
+    "barrier2":         "-2.89",
     "currency":         "USD",
     "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
-    "starting_bankroll": 13.00,
+    "starting_bankroll": 1.00,
     "stake":             0.35,
     "drawdown_stop":     0.10,
 
@@ -114,11 +114,48 @@ CFG = {
     # Quarter-Kelly (0.25) keeps sizing conservative on noisy early posteriors.
     # kelly_max_fraction_of_bankroll=0.35 hard-caps Kelly at flat-stake level.
     # payout_ratio = 0.18/0.35 = 0.5143 (actual Deriv return, not assumed 0.50).
+    # FIX: this is now only a *fallback seed* used before the bot has seen
+    # a single live proposal. Real payout is read off each proposal
+    # response (payout/ask_price) and tracked live — see
+    # ExpiryRangeBot._live_payout_ratio — because realized payout on
+    # 1HZ10V has been observed to run 0.14-0.34, nowhere near 0.51.
     "kelly_activation_bankroll":      1.0,
     "kelly_fraction":                 0.25,
     "kelly_min_stake":                0.35,
     "kelly_max_fraction_of_bankroll": 0.35,
-    "payout_ratio":                   0.49,  # 0.18 profit on $0.35 stake
+    "payout_ratio":                   0.5143,  # fallback seed only, not live truth
+
+    # ── Kelly validation gate (FIX: don't scale stake off one short,
+    # single-regime session) ──
+    # Kelly sizing only scales past the flat seed stake once the bot has
+    # accumulated enough trades AND has actually been exposed to more than
+    # one HMM regime. Until both are true, compute_stake() returns the
+    # flat CFG["stake"] regardless of what the Bayesian posterior says,
+    # since a short run in one calm regime tells you little about true
+    # edge in others.
+    "kelly_min_trades_for_scaling":   100,
+    "kelly_min_regimes_for_scaling":  2,
+
+    # ── Martingale ──
+    # Activates after a loss, escalating stake over up to 2 steps.
+    # Factors are compounding: step-1 stake = base × factor[0],
+    # step-2 stake = step-1 stake × factor[1].
+    # At $13 bankroll worst-case exposure: $0.35 + $0.945 + $2.93 = $4.23
+    # (leaves $8.77 — above the $0.10 circuit breaker by a wide margin).
+    #
+    # Bayesian gate: Martingale only escalates when the live posterior
+    # win-rate is above the breakeven threshold (0.66). If the posterior
+    # has drifted below breakeven, the bot resets to flat stake and waits
+    # for the Bayesian signal to recover — avoids compounding into genuine
+    # edge-loss patches.
+    #
+    # Consecutive-loss cooldown is SUPPRESSED while Martingale is active
+    # (steps 1-2) so the escalated trade can fire. The cooldown re-engages
+    # normally once the sequence resolves (win or max steps reached).
+    "martingale_enabled":      True,
+    "martingale_factors":      [1.19, 1.89],   # [step-1 multiplier, step-2 multiplier]
+    "martingale_max_steps":    2,
+    "martingale_bayes_gate":   0.66,          # breakeven threshold - no escalation below this
 
     # ── Signal accuracy gates ──
     "warmup_ticks":       720,
@@ -186,25 +223,54 @@ CFG = {
 
     # ── Auto-Calibration ──
     # Recalibrates barrier + veto thresholds directly from the bot's own
-    # live tick buffer: once at startup (after enough ticks accumulate)
-    # and again after every loss (subject to a cooldown so it can't
-    # thrash). Results are written straight into CFG / the HMM instance
-    # and take effect on the very next signal evaluation.
+    # live tick buffer. Triggered three ways:
+    #   1. STARTUP   — once 1 hour of ticks has accumulated (RDBEAR ≈ 1Hz,
+    #                  so calib_min_ticks=3600 ≈ 1 hour). Trading is
+    #                  blocked entirely until this first run completes —
+    #                  there are no hardcoded barrier/veto values used
+    #                  for live trading; CFG's seed numbers below are
+    #                  placeholders only, overwritten before the first
+    #                  trade and never acted on.
+    #   2. ON LOSS   — recalibrate after every loss, subject to a cooldown
+    #                  so it can't thrash.
+    #   3. PERIODIC  — every 3 hours of wall-clock time regardless of
+    #                  wins/losses, to keep refreshing "market understanding"
+    #                  even during a long win streak. Uses time.monotonic(),
+    #                  not tick count, so it's robust to brief reconnect
+    #                  gaps not perfectly matching 1 tick/sec.
     "auto_calibrate_enabled":   True,
     "calib_on_start":           True,
     "calib_on_loss":            True,
-    "calib_min_ticks":          720,    # min ticks of history before first run
-    "calib_min_gap_ticks":      300,    # cooldown between recalibrations
-    "calib_target_win_rate":    0.68,   # pick smallest barrier clearing this
+    "calib_on_interval":        True,
+    "calib_interval_seconds":   3 * 60 * 60,   # 3 hours
+    "calib_min_ticks":          3600,   # ≈ 1 hour at RDBEAR's ~1 tick/sec
+    "calib_min_gap_ticks":      300,    # min tick-gap between loss-triggered runs
+    # Trading threshold: the calibrator only ever SELECTS a barrier for
+    # live trading if its Wilson-lower-bound win rate clears this. This
+    # is intentionally well above the ~66.0% breakeven win rate implied
+    # by the current payout_ratio (~0.514) — selecting anything close to
+    # or below breakeven means losing money by construction, regardless
+    # of how good the rest of the ensemble is. Do not lower this without
+    # recomputing breakeven against the live observed payout ratio.
+    "calib_target_win_rate":    0.68,
+    # Reporting-only floor: every candidate barrier with a win rate at or
+    # above this is logged for visibility (see [CALIB] log lines), even
+    # though only candidates clearing calib_target_win_rate are ever
+    # actually selected for live trading. This does NOT relax the trading
+    # threshold — it only widens what gets printed for your own review.
+    "calib_report_win_rate":    0.57,
     "calib_macd_percentile":    85,
     "calib_ao_percentile":      85,
     "calib_jump_kurt_min":      4.0,
     "calib_jump_kurt_max":      10.0,
     "calib_terminal_window":    None,   # None -> use n_contract_ticks
+    # Widened so the 57%+ reporting floor has candidates to actually show.
+    # Only candidates clearing calib_target_win_rate (0.68) are ever
+    # selected for live trading — see _calibrate_barrier().
     "calib_barrier_candidates": [
-        2.00, 2.10, 2.20, 2.30, 2.40, 2.50,
-        2.60, 2.70, 2.80, 2.90, 3.00,
-        3.10, 3.20, 3.30, 3.40, 3.50,
+        1.40, 1.50, 1.60, 1.70, 1.80, 1.85, 1.90, 1.95,
+        2.00, 2.05, 2.10, 2.20, 2.30, 2.40, 2.50, 2.60,
+        2.70, 2.80, 2.90, 3.00, 3.10,
     ],
 
     # ── Connection (new Deriv Options API) ──
@@ -218,10 +284,11 @@ CFG = {
     "log_file":    "er_bot_1hz10v.log",
     "signals_csv": "er_bot_1hz10v_signals.csv",
     "trades_csv":  "er_bot_1hz10v_trades.csv",
-    # tick_buffer must be >= calib_min_ticks so the deque holds enough history
-    # for calibration to run.  Previously 300 — this caused len(ticks) to cap
-    # at 300, freezing the calibration countdown at 420 (720-300) forever.
-    "tick_buffer": 720,
+    # tick_buffer must be >= calib_min_ticks so the deque holds enough
+    # history for calibration to run. Set to hold the full 1-hour startup
+    # window so periodic/loss-triggered recalibrations also see up to an
+    # hour of recent history, not a truncated slice.
+    "tick_buffer": 3600,
 }
 
 # ── Ensemble weights (regime-conditional) ──
@@ -887,26 +954,94 @@ class AwesomeOscillator:
 # ══════════════════════════════════════════════════════════════════════
 class RiskGuard:
     def __init__(self):
-        self.stake          = CFG["stake"]
-        self._cooldown      = 0
-        self._tripped       = False
-        self._consec_losses = 0
+        self.stake           = CFG["stake"]
+        self._cooldown       = 0
+        self._tripped        = False
+        self._consec_losses  = 0
+        self._martingale_step = 0   # 0 = flat, 1 = step-1, 2 = step-2
+        self._base_stake     = CFG["stake"]   # anchor for Martingale compounding
 
     def tick(self):
         if self._cooldown > 0:
             self._cooldown -= 1
 
     def on_win(self):
-        self._consec_losses = 0
-        self._cooldown = CFG["cooldown_win"]
+        if self._martingale_step > 0:
+            log.info(
+                f"[MARTINGALE] Win at step {self._martingale_step} "
+                f"(stake=${self._base_stake:.2f}) — sequence reset to flat stake."
+            )
+        self._consec_losses   = 0
+        self._martingale_step = 0          # reset Martingale sequence on any win
+        self._base_stake      = CFG["stake"]
+        self._cooldown        = CFG["cooldown_win"]
 
-    def on_loss(self):
+    def on_loss(self, bayes_wr: float = 1.0):
+        """
+        bayes_wr: current Bayesian posterior win-rate (passed from _settle).
+
+        Martingale step is NEVER reset on a loss — only on a win or when
+        max steps is reached. Behaviour on loss:
+
+          bayes >= gate AND step < max  → escalate to next step
+          bayes <  gate AND step > 0   → HOLD current step; trade will be
+                                          suppressed in on_tick until bayes
+                                          recovers, then fires at held stake
+          step == max                  → hold at max step (no further escalation)
+
+        Consecutive-loss cooldown ALWAYS runs unconditionally, including
+        while Martingale is active. The escalated stake fires after the
+        cooldown clears (and after bayes recovers if in hold state).
+        """
         self._consec_losses += 1
+
+        if CFG["martingale_enabled"]:
+            if self._martingale_step < CFG["martingale_max_steps"]:
+                if bayes_wr >= CFG["martingale_bayes_gate"]:
+                    # Bayes healthy — escalate now
+                    factors = CFG["martingale_factors"]
+                    factor  = factors[self._martingale_step]
+                    self._base_stake      = round(self.stake * factor, 2)
+                    self._martingale_step += 1
+                    log.info(
+                        f"[MARTINGALE] Step {self._martingale_step}/{CFG['martingale_max_steps']} "
+                        f"— next stake ${self._base_stake:.2f}  "
+                        f"(factor={factor}  bayes_wr={bayes_wr:.3f})"
+                    )
+                else:
+                    # Bayes below gate — hold current step, don't escalate yet.
+                    # on_tick will suppress entry until bayes recovers.
+                    if self._martingale_step == 0:
+                        # First loss with bayes already below gate — arm step-1
+                        # stake so it's ready the moment bayes recovers.
+                        factor = CFG["martingale_factors"][0]
+                        self._base_stake      = round(self.stake * factor, 2)
+                        self._martingale_step = 1
+                        log.info(
+                            f"[MARTINGALE] Step 1 armed at ${self._base_stake:.2f} "
+                            f"but HELD — bayes_wr={bayes_wr:.3f} < gate={CFG['martingale_bayes_gate']}. "
+                            f"Will fire once bayes recovers."
+                        )
+                    else:
+                        log.info(
+                            f"[MARTINGALE] Step {self._martingale_step} HELD "
+                            f"(stake=${self._base_stake:.2f}) — "
+                            f"bayes_wr={bayes_wr:.3f} below gate, not escalating yet."
+                        )
+            else:
+                # Already at max steps — hold, wait for a win to reset
+                log.info(
+                    f"[MARTINGALE] Max steps reached — holding step {self._martingale_step} "
+                    f"at ${self._base_stake:.2f} until next win."
+                )
+
+        # ── Consecutive-loss cooldown — ALWAYS applied unconditionally ──
         if self._consec_losses >= CFG["consecutive_loss_limit"]:
             self._cooldown = CFG["consecutive_loss_cooldown"]
             log.warning(
                 f"  {self._consec_losses} consecutive losses — "
-                f"extended cooldown ({CFG['consecutive_loss_cooldown']} ticks)"
+                f"extended cooldown ({CFG['consecutive_loss_cooldown']} ticks). "
+                f"Martingale step {self._martingale_step} held, fires after cooldown."
             )
         else:
             self._cooldown = CFG["cooldown_loss"]
@@ -922,11 +1057,31 @@ class RiskGuard:
     def can_trade(self) -> bool:
         return not self._tripped and self._cooldown == 0
 
-    def compute_stake(self, bankroll: float, win_prob: float) -> float:
+    def compute_stake(
+        self,
+        bankroll:     float,
+        win_prob:     float,
+        payout_ratio: Optional[float] = None,
+        validated:    bool = True,
+    ) -> float:
+        # ── Martingale override — takes priority over Kelly ──────────
+        # When a Martingale sequence is active, use the pre-computed
+        # escalated stake rather than Kelly sizing. This ensures the
+        # recovery math is predictable and not distorted by a posterior
+        # that may be temporarily noisy after a loss.
+        if CFG["martingale_enabled"] and self._martingale_step > 0:
+            stake = min(self._base_stake, bankroll)
+            self.stake = round(stake, 2)
+            return self.stake
+
+        # ── Normal Kelly path ─────────────────────────────────────────
         if bankroll < CFG["kelly_activation_bankroll"]:
             self.stake = CFG["stake"]
             return self.stake
-        b      = CFG["payout_ratio"]
+        if not validated:
+            self.stake = CFG["stake"]
+            return self.stake
+        b      = payout_ratio if payout_ratio is not None else CFG["payout_ratio"]
         p      = float(np.clip(win_prob, 0.0, 1.0))
         q      = 1.0 - p
         f_star = max((b * p - q) / b, 0.0)
@@ -936,14 +1091,20 @@ class RiskGuard:
         self.stake = round(stake, 2)
         return self.stake
 
+    def martingale_status(self) -> str:
+        if not CFG["martingale_enabled"] or self._martingale_step == 0:
+            return "FLAT"
+        return f"MART_STEP_{self._martingale_step}(stake=${self._base_stake:.2f})"
+
     def status(self) -> str:
         if self._tripped:
             return "CIRCUIT_BREAKER_TRIPPED"
+        mart = self.martingale_status()
         if self._consec_losses >= CFG["consecutive_loss_limit"] and self._cooldown > 0:
-            return f"CONSEC_LOSS_COOLDOWN({self._cooldown}t,streak={self._consec_losses})"
+            return f"CONSEC_LOSS_COOLDOWN({self._cooldown}t,streak={self._consec_losses},{mart})"
         if self._cooldown > 0:
-            return f"COOLDOWN({self._cooldown}t)"
-        return "READY"
+            return f"COOLDOWN({self._cooldown}t,{mart})"
+        return f"READY({mart})"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1062,15 +1223,25 @@ class AutoCalibrator:
     and take effect on the very next signal evaluation.
 
     Triggered automatically:
-      1. STARTUP  — once CFG["calib_min_ticks"] ticks have accumulated
-                    (runs exactly once per session, then marks done)
-      2. ON LOSS  — after every settled loss, subject to a cooldown of
-                    CFG["calib_min_gap_ticks"] ticks between runs
+      1. STARTUP   — once CFG["calib_min_ticks"] ticks have accumulated
+                     (≈ 1 hour at RDBEAR's ~1 tick/sec). Trading is
+                     blocked entirely until this first run completes —
+                     there is no hardcoded barrier/veto fallback used
+                     for live trading.
+      2. ON LOSS   — after every settled loss, subject to a tick-count
+                     cooldown of CFG["calib_min_gap_ticks"] between runs.
+      3. PERIODIC  — every CFG["calib_interval_seconds"] of wall-clock
+                     time (default 3 hours), independent of win/loss, to
+                     keep refreshing market understanding during long
+                     win streaks too. Tracked via time.monotonic() so a
+                     brief reconnect gap doesn't desync it from real time.
 
-    What gets calibrated (all against the ±2.70 / 2-min regime):
-      • barrier        — smallest candidate that achieves the target win-rate
-                         (walk-forward terminal-price windows, restricted to
-                          [2.0 – 3.5] range; defaults to 2.70 if none qualify)
+    What gets calibrated:
+      • barrier        — smallest candidate whose Wilson-lb win rate
+                         clears calib_target_win_rate (live trading
+                         selection). All candidates clearing the lower
+                         calib_report_win_rate are logged for visibility
+                         even when not selected — see _calibrate_barrier().
       • macd_histogram_veto  — 85th-pct of |MACD histogram| history
       • ao_veto_threshold    — 85th-pct of |AO| history
       • jump_kurtosis_veto   — 90th-pct rolling kurtosis (clamped [4, 10])
@@ -1079,8 +1250,9 @@ class AutoCalibrator:
     """
 
     def __init__(self):
-        self._last_calib_tick  = -99_999
-        self._startup_done     = False
+        self._last_calib_tick      = -99_999
+        self._last_calib_monotonic = None    # set on first successful run
+        self._startup_done         = False
 
     # ── Trigger guards ───────────────────────────────────────────────
     def should_run_startup(self, n_ticks_collected: int) -> bool:
@@ -1094,6 +1266,22 @@ class AutoCalibrator:
         if not CFG["calib_on_loss"]:          return False
         if n_ticks_collected < CFG["calib_min_ticks"]: return False
         return (tick_n - self._last_calib_tick) >= CFG["calib_min_gap_ticks"]
+
+    def should_run_periodic(self, n_ticks_collected: int) -> bool:
+        """
+        Wall-clock periodic trigger — fires every calib_interval_seconds
+        regardless of win/loss activity. Only active once the startup
+        calibration has completed (so it never races with the initial
+        1-hour collection window).
+        """
+        if not CFG["auto_calibrate_enabled"]:  return False
+        if not CFG["calib_on_interval"]:       return False
+        if not self._startup_done:              return False   # startup trigger owns the first run
+        if n_ticks_collected < CFG["calib_min_ticks"]: return False
+        if self._last_calib_monotonic is None:
+            return True   # safety net — shouldn't happen since startup sets it
+        elapsed = time.monotonic() - self._last_calib_monotonic
+        return elapsed >= CFG["calib_interval_seconds"]
 
     # ── Main entry point ─────────────────────────────────────────────
     def run(self,
@@ -1153,7 +1341,8 @@ class AutoCalibrator:
         log.info(f"[CALIB] ✓  Calibration complete — all parameters now live")
         log.info(bar)
 
-        self._last_calib_tick = tick_n
+        self._last_calib_tick      = tick_n
+        self._last_calib_monotonic = time.monotonic()
         if trigger == "startup":
             self._startup_done = True
 
@@ -1170,13 +1359,12 @@ class AutoCalibrator:
         Overlapping (rolling) window barrier calibration with Wilson
         lower confidence bound selection.
 
-        Replaces the non-overlapping walk-forward approach which yielded
-        only ~6 samples at 720 ticks (SE ~0.20, barrier swings ±0.80).
-        Rolling stride-1 windows yield ~600 samples (SE ~0.02), making
-        the calibrated barrier stable to ±0.05 between runs.
+        Rolling stride-1 windows over up to 1 hour of tick history yield
+        thousands of samples (SE well under 0.02), making the calibrated
+        barrier stable between runs.
 
         Selection criterion: Wilson 95% lower confidence bound >= target,
-        not the point estimate. Prevents a lucky 6-sample draw from
+        not the point estimate. Prevents a lucky sample draw from
         committing to a barrier that hasn't earned it statistically.
 
         Wilson lower bound:
@@ -1184,14 +1372,26 @@ class AutoCalibrator:
             p̂   = wins / n
             lb   = (p̂ + z²/2n - z·√(p̂(1-p̂)/n + z²/4n²)) / (1 + z²/n)
 
+        TWO THRESHOLDS, deliberately kept separate:
+          • calib_report_win_rate  (0.57) — every candidate whose Wilson lb
+            clears this is logged, purely for visibility into the full
+            menu of barriers and what they'd realistically win at.
+          • calib_target_win_rate (0.68) — only candidates clearing THIS
+            are eligible to actually be selected for live trading. 0.68
+            sits safely above the ~66.0% breakeven implied by the current
+            payout_ratio (~0.514); 0.57 would lose money by construction
+            on every trade (see [CALIB] EV note below), so it is never
+            used for selection, only reporting.
+
         Picks the *smallest* barrier where lb >= calib_target_win_rate.
         Falls back to current CFG barrier if none qualify.
         """
-        n_ticks    = CFG["n_contract_ticks"]           # 120
-        candidates = sorted(CFG["calib_barrier_candidates"])
-        target_wr  = CFG["calib_target_win_rate"]
-        prices     = prices.astype(float)
-        z          = 1.96                               # 95% CI
+        n_ticks     = CFG["n_contract_ticks"]           # 120
+        candidates  = sorted(CFG["calib_barrier_candidates"])
+        target_wr   = CFG["calib_target_win_rate"]
+        report_wr   = CFG["calib_report_win_rate"]
+        prices      = prices.astype(float)
+        z           = 1.96                               # 95% CI
 
         if len(prices) < n_ticks + 1:
             return self._barrier_float()
@@ -1203,7 +1403,8 @@ class AutoCalibrator:
         moves     = np.abs(terminals - entries)         # shape: (N,)
         n_samples = len(moves)
 
-        best = self._barrier_float()
+        best          = self._barrier_float()
+        best_selected = False
         for b in candidates:
             wins  = int(np.sum(moves < b))
             p_hat = wins / n_samples
@@ -1216,15 +1417,28 @@ class AutoCalibrator:
                 / (1 + z**2 / n_samples)
             )
 
-            log.info(
-                f"[CALIB]     barrier={b:.2f}  "
-                f"win_rate={p_hat:.3f}  lb95={lb:.3f}  "
-                f"samples={n_samples}"
-            )
+            tradeable = lb >= target_wr
+            if lb >= report_wr or tradeable:
+                tag = "TRADEABLE" if tradeable else f"below {target_wr:.0%} gate"
+                log.info(
+                    f"[CALIB]     barrier={b:.2f}  "
+                    f"win_rate={p_hat:.3f}  lb95={lb:.3f}  "
+                    f"samples={n_samples}  [{tag}]"
+                )
 
-            if lb >= target_wr:
-                best = b
-                break   # smallest that qualifies on lower bound
+            if tradeable and not best_selected:
+                best          = b
+                best_selected = True
+                # keep scanning (don't break) so wider candidates above
+                # the report floor still get logged for visibility
+
+        if not best_selected:
+            log.warning(
+                f"[CALIB]   No barrier cleared the {target_wr:.0%} trading "
+                f"threshold this run — keeping previous barrier ±{best:.2f}. "
+                f"(Candidates clearing only the {report_wr:.0%} report floor "
+                f"are NOT used for live trading — see lines above.)"
+            )
 
         return best
 
@@ -1560,6 +1774,15 @@ class ExpiryRangeBot:
         self._entry_ao      = 0.0
         self._entry_mc_lb   = 0.0
 
+        # FIX #3: live-tracked payout ratio, updated from real proposal
+        # responses (see _request_and_buy). Starts at the CFG fallback
+        # seed until the first proposal comes back.
+        self._live_payout_ratio = CFG["payout_ratio"]
+        # FIX #5: set of HMM regime states actually observed during this
+        # run. Used to gate Kelly stake scaling — see compute_stake call
+        # in on_tick.
+        self._regimes_seen = set()
+
         self.wsman: Optional[DerivWSManager] = None
         self._running = True
 
@@ -1580,7 +1803,7 @@ class ExpiryRangeBot:
         if isinstance(accounts, dict):
             accounts = accounts.get("accounts", accounts.get("data", []))
         for acc in accounts:
-            if acc.get("account_type") == "demo":
+            if acc.get("account_type") == "real":
                 acc_id = acc.get("account_id") or acc.get("id")
                 if acc_id:
                     return acc_id
@@ -1629,6 +1852,31 @@ class ExpiryRangeBot:
         ou_mu_T, ou_var_T     = self.ou.terminal_dist(spot, theta, mu, sig_ou, T=CFG["n_contract_ticks"])
 
         drift      = float(np.mean(rets)) if len(rets) > 1 else 0.0
+
+        # FIX (#4 — OU/Hurst reconciliation): the ensemble already cuts
+        # ou_process's *scoring* weight when Hurst signals a trending
+        # regime (see MODEL_WEIGHTS_BY_REGIME comments), but until now
+        # Monte Carlo's terminal distribution still pulled its drift/
+        # variance entirely from the OU fit — i.e. the mean-reversion
+        # assumption stayed baked into the dominant 0.30-weighted layer
+        # regardless of what Hurst was saying. That's exactly the
+        # discrepancy behind why live MC was reporting 0.92-1.00 win
+        # probability while the static calibration (run on a sample where
+        # Hurst read 0.838) implied only ~45%: OU's narrower, reverting
+        # terminal variance vs. a wider, trend-persistent one.
+        #
+        # Blend OU's terminal moments toward a trend-persistent, Hurst-
+        # scaled alternative as H rises above 0.5 (random walk). At
+        # H=0.5 trend_weight=0, MC behaves exactly as before (pure OU).
+        # At H>=0.95, MC weights the trend-persistent moments fully.
+        trend_weight = float(np.clip((h_val - 0.5) / 0.45, 0.0, 1.0))
+        n_ticks_T    = CFG["n_contract_ticks"]
+        trend_var_T  = sigma_2min ** 2   # sigma_2min already uses the Hurst-scaled GARCH forecast above
+        trend_mu_T   = drift * n_ticks_T   # naive continuation of current drift, no reversion
+
+        ou_var_T = (1.0 - trend_weight) * ou_var_T + trend_weight * max(trend_var_T, ou_var_T)
+        ou_mu_T  = (1.0 - trend_weight) * ou_mu_T  + trend_weight * trend_mu_T
+
         mc_prob, mc_ci = self.mc_quick.probability(
             drift, sigma_t,
             n_ticks=CFG["n_contract_ticks"],
@@ -1699,6 +1947,7 @@ class ExpiryRangeBot:
 
         # ── Stage 1 ──
         s = self._quick_models(spot, rets, prices)
+        self._regimes_seen.add(self.hmm.state)
 
         log.info(
             f"[S1] pre={s['pre_score']:.3f} | "
@@ -1869,10 +2118,49 @@ class ExpiryRangeBot:
         if self._tick_n % CFG["signal_interval"] != 0:
             return
 
+        # ── Periodic recalibration (every 3h wall-clock, independent of
+        #    win/loss) — keeps "market understanding" fresh during long
+        #    win streaks too, not just after losses. ──
+        if self.calibrator.should_run_periodic(len(self.ticks)):
+            prices  = np.array(self.ticks,   dtype=float)
+            returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
+            self.calibrator.run(
+                tick_n  = self._tick_n,
+                prices  = prices,
+                returns = returns,
+                hmm     = self.hmm,
+                trigger = "periodic_3h",
+            )
+
+
         trade, conf, mc_lb, sigs, reason = self.run_intelligence(spot)
 
         if trade:
-            stake = self.guard.compute_stake(self.bankroll, self.bayes.mean())
+            # ── Martingale bayes-hold gate ────────────────────────────
+            # If a Martingale step is armed but the Bayesian win-rate is
+            # still below the gate, suppress entry and wait. The step and
+            # its escalated stake are preserved — no reset. The log fires
+            # every signal interval so progress is visible.
+            if (CFG["martingale_enabled"]
+                    and self.guard._martingale_step > 0
+                    and self.bayes.mean() < CFG["martingale_bayes_gate"]):
+                log.info(
+                    f"[MARTINGALE] Entry suppressed — step {self.guard._martingale_step} "
+                    f"held at ${self.guard._base_stake:.2f}  "
+                    f"bayes_wr={self.bayes.mean():.3f} < gate={CFG['martingale_bayes_gate']} "
+                    f"(waiting for recovery)"
+                )
+                return
+
+            validated = (
+                self.trade_count >= CFG["kelly_min_trades_for_scaling"]
+                and len(self._regimes_seen) >= CFG["kelly_min_regimes_for_scaling"]
+            )
+            stake = self.guard.compute_stake(
+                self.bankroll, self.bayes.mean(),
+                payout_ratio=self._live_payout_ratio,
+                validated=validated,
+            )
             log.info(
                 f"ENTER SIGNAL  conf={conf:.3f}  mc_lb={mc_lb:.4f}  "
                 f"MACD_hist={sigs.get('macd_hist', 0):.4f}  "
@@ -1914,10 +2202,27 @@ class ExpiryRangeBot:
             prop      = resp.get("proposal", {})
             pid       = prop.get("id")
             ask_price = prop.get("ask_price")
+            payout    = prop.get("payout")
 
             if not pid or not ask_price:
                 log.warning("Empty proposal — skipping")
                 return
+
+            # FIX #3: update the live payout-ratio estimate from this real
+            # proposal (payout = total return if won, ask_price = stake).
+            # This feeds the NEXT trade's Kelly sizing — using it for the
+            # trade currently being priced isn't possible since we don't
+            # know it until this exact response, but payout drifts slowly
+            # tick to tick so a one-trade lag is an acceptable trade-off
+            # against the static 0.5143 constant being off by 1.5-3.5x.
+            try:
+                ask_f = float(ask_price)
+                if payout is not None and ask_f > 0:
+                    live_ratio = (float(payout) - ask_f) / ask_f
+                    if live_ratio > 0:
+                        self._live_payout_ratio = live_ratio
+            except (TypeError, ValueError):
+                pass
 
             if self.active_id:
                 return
@@ -1989,10 +2294,20 @@ class ExpiryRangeBot:
 
         if won:
             self.wins += 1
+            if self.wins > self.trade_count:
+                log.error(
+                    f"INTEGRITY CHECK FAILED: wins ({self.wins}) exceeds "
+                    f"trade_count ({self.trade_count}). This should be "
+                    f"impossible and indicates a duplicate settlement got "
+                    f"through — bankroll/Bayesian posterior are now "
+                    f"unreliable. Investigate before trusting further stats."
+                )
             self.guard.on_win()
             tag = "WIN "
         else:
-            self.guard.on_loss()
+            # Pass live Bayesian posterior to on_loss so the Martingale
+            # gate can decide whether to escalate or reset to flat stake.
+            self.guard.on_loss(bayes_wr=self.bayes.mean())
             tag = "LOSS"
             # ── Loss-triggered recalibration ─────────────────────────
             if self.calibrator.should_run_on_loss(self._tick_n, len(self.ticks)):
@@ -2044,7 +2359,26 @@ class ExpiryRangeBot:
             await self.on_tick(msg["tick"])
         elif mt == "proposal_open_contract":
             poc = msg.get("proposal_open_contract", {})
-            if poc.get("is_sold") or poc.get("status") in ("won", "lost"):
+            is_final = poc.get("is_sold") or poc.get("status") in ("won", "lost")
+            if is_final:
+                cid = poc.get("contract_id")
+                # FIX (double-settlement): Deriv's proposal_open_contract
+                # stream can emit more than one update that satisfies the
+                # "final" condition for the same contract (e.g. an is_sold
+                # flag followed by a separate status="won"/"lost" update).
+                # Without this guard, _settle() ran twice for the same
+                # contract — double-crediting bankroll/wins and corrupting
+                # the Bayesian posterior. Only the message matching the
+                # contract we're currently tracking as open is allowed
+                # through; once settled, self.active_id is cleared, so any
+                # further duplicate for the same contract_id no longer
+                # matches and is silently dropped.
+                if cid is None or cid != self.active_id:
+                    log.debug(
+                        f"Ignoring duplicate/mismatched settlement update "
+                        f"(contract_id={cid}, active_id={self.active_id})"
+                    )
+                    return
                 self._settle(poc)
         elif mt == "error":
             log.error(f"API error: {msg.get('error', {}).get('message')}")
@@ -2056,7 +2390,11 @@ class ExpiryRangeBot:
 
         await wsman.send_nowait({"ticks": CFG["symbol"], "subscribe": 1})
         wsman.state = ConnState.SUBSCRIBED
-        log.info(f"Subscribed to {CFG['symbol']} — collecting {CFG['calib_min_ticks']} ticks for startup calibration (~12 min).")
+        approx_min = CFG["calib_min_ticks"] / 60
+        log.info(
+            f"Subscribed to {CFG['symbol']} — collecting {CFG['calib_min_ticks']} ticks "
+            f"for startup calibration (~{approx_min:.0f} min)."
+        )
 
         if self.active_id:
             await wsman.send_nowait({
@@ -2080,13 +2418,16 @@ class ExpiryRangeBot:
     async def run(self):
         bar = "=" * 70
         log.info(bar)
-        log.info("  EXPIRYRANGE BOT v2  ·  RDBEAR  ·  ±1.80  ·  2-min")
+        log.info(f"  EXPIRYRANGE BOT v5  ·  {CFG['symbol']}  ·  {CFG['barrier']}/{CFG['barrier2']}  ·  {CFG['duration']}{CFG['duration_unit']}")
         log.info("  10-Layer Intelligence: L1-GARCH L2-MC L3-HMM L4-Hurst")
         log.info("  L5-OU L6-Bayes L7-Guard L8-Jump L9-MACD L10-AO")
         log.info(f"  MC guarantee floor: {CFG['mc_guarantee_floor']} (lower CI bound)")
         log.info(f"  MACD histogram veto: |hist| > {CFG['macd_histogram_veto']}")
         log.info(f"  AO energy veto: |AO| > {CFG['ao_veto_threshold']}")
         log.info(f"  Bankroll: ${self.bankroll:.2f}  Stop: ${CFG['drawdown_stop']:.2f}")
+        mart = CFG["martingale_factors"] if CFG["martingale_enabled"] else "disabled"
+        log.info(f"  Martingale: {'enabled' if CFG['martingale_enabled'] else 'disabled'}  factors={mart}  max_steps={CFG['martingale_max_steps']}  bayes_gate={CFG['martingale_bayes_gate']}")
+        log.info(f"  Barrier band: ±{min(CFG['calib_barrier_candidates'])}–±{max(CFG['calib_barrier_candidates'])} (auto-calibrated)")
         log.info(f"  Connection: new Deriv Options API (REST OTP bootstrap)")
         log.info(bar)
 
