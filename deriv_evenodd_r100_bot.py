@@ -83,7 +83,7 @@ TOP_K_DEEP_DIVE = 5                            # symbols deep-validated per cali
 BASE_CONFIDENCE_THRESHOLD = 0.20       # placeholder floor ONLY used before the calibrator has
                                         # gathered enough samples to compute an empirical one
 MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
-CANDIDATE_DURATIONS = [1, 3, 5, 10, 15]  # ticks, Monte Carlo picks the best of these
+CANDIDATE_DURATIONS = [1, 3, 5, 10,]  # ticks, Monte Carlo picks the best of these
 
 THRESHOLD_PERCENTILE = 80              # trade only on scores in the top (100-X)% of this
                                         # symbol's own empirical score distribution
