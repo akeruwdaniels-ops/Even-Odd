@@ -80,9 +80,17 @@ MAX_LOSS_CALIBRATIONS_PER_24H = 3              # rate limiter, default - tune as
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
 TOP_K_DEEP_DIVE = 5                            # symbols deep-validated per calibration
 
-CONFIDENCE_THRESHOLD = 0.52            # minimum ensemble score to trade (0-1 scale)
+BASE_CONFIDENCE_THRESHOLD = 0.20       # placeholder floor ONLY used before the calibrator has
+                                        # gathered enough samples to compute an empirical one
 MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
 CANDIDATE_DURATIONS = [1, 3, 5, 10, 15]  # ticks, Monte Carlo picks the best of these
+
+THRESHOLD_PERCENTILE = 80              # trade only on scores in the top (100-X)% of this
+                                        # symbol's own empirical score distribution
+MIN_SCORE_SAMPLES = 30                 # min samples (per symbol) before trusting its own
+                                        # percentile over the pooled/global fallback
+THRESHOLD_FLOOR = 0.05                 # never let the dynamic threshold collapse to ~0
+THRESHOLD_CEILING = 0.95                # sanity cap, in case of a pathological distribution
 
 MIN_TICKS_REQUIRED = 60                # minimum ticks buffered before a symbol is scored
 
@@ -102,6 +110,13 @@ class TradeState:
         self.loss_triggered_calibrations_24h = deque()   # timestamps
         self.last_scheduled_calibration = time.time()
         self.last_calibration_end = 0.0
+
+        # empirical score distribution (confidence*reliability) per symbol, fed both by
+        # the calibrator's historical walk-forward and by live scans as they happen.
+        # dynamic_threshold_for() turns this into a percentile-based trade bar.
+        self.score_history = defaultdict(lambda: deque(maxlen=300))
+        self.global_threshold = BASE_CONFIDENCE_THRESHOLD  # pooled fallback, refined after calibration
+        self.initial_calibration_done = False
 
 
 class SymbolData:
@@ -584,21 +599,37 @@ def monte_carlo_duration(prices, returns, direction, candidate_durations, n_sims
 # ---------------------------------------------------------------------------
 # ENSEMBLE SELECTOR
 # ---------------------------------------------------------------------------
-def select_trade(symbol_scores, reliability):
+def dynamic_threshold_for(symbol, state):
+    """The trade bar for this symbol, derived from its own empirical score
+    distribution (THRESHOLD_PERCENTILE-th percentile of observed
+    confidence*reliability scores) once the calibrator/live scans have
+    gathered MIN_SCORE_SAMPLES for it. Falls back to the pooled
+    `state.global_threshold` (itself percentile-derived once any calibration
+    has run, or BASE_CONFIDENCE_THRESHOLD before that) for symbols that
+    haven't accumulated enough history yet."""
+    hist = state.score_history.get(symbol)
+    if hist and len(hist) >= MIN_SCORE_SAMPLES:
+        pct = float(np.percentile(np.array(hist), THRESHOLD_PERCENTILE))
+        return float(np.clip(pct, THRESHOLD_FLOOR, THRESHOLD_CEILING))
+    return state.global_threshold
+
+
+def select_trade(symbol_scores, state):
     scored = []
     for symbol, (p_up, confidence) in symbol_scores.items():
-        score = confidence * reliability.get(symbol, 1.0)
+        score = confidence * state.reliability.get(symbol, 1.0)
         direction = 1 if p_up > 0.5 else -1
-        scored.append((symbol, direction, p_up, score))
+        threshold = dynamic_threshold_for(symbol, state)
+        scored.append((symbol, direction, p_up, score, threshold))
     if not scored:
         return None
     scored.sort(key=lambda x: x[3], reverse=True)
     top = scored[0]
-    if top[3] < CONFIDENCE_THRESHOLD:
+    if top[3] < top[4]:
         return None
     if len(scored) > 1 and (top[3] - scored[1][3]) < MIN_SCORE_GAP:
         return None
-    return top  # (symbol, direction, p_up, score)
+    return top[0], top[1], top[2], top[3]  # (symbol, direction, p_up, score)
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +722,47 @@ def light_walk_forward(sd, window=200, step=20):
     return hits / total if total > 0 else 0.5
 
 
+def collect_historical_scores(sd, window=150, step=5, max_points=120):
+    """Walks back through this symbol's buffered tick history, replaying what
+    `bayesian_fusion` would have scored at each checkpoint. This is what
+    builds the empirical score distribution `dynamic_threshold_for` turns
+    into a trade bar - instead of a hand-picked constant, the threshold
+    is read off how this exact pipeline actually scores real market data.
+
+    `copula_agree` is fixed at the neutral 0.5 here since cross-symbol
+    momentum at each historical checkpoint isn't reconstructable cheaply;
+    every other layer uses real historical values."""
+    prices_full = sd.prices()
+    if len(prices_full) < window + 20:
+        return []
+    indices = list(range(window, len(prices_full), step))[-max_points:]
+    scores = []
+    for i in indices:
+        window_prices = prices_full[:i]
+        window_returns = np.diff(window_prices) / window_prices[:-1]
+        if len(window_returns) < 20:
+            continue
+        hmm = hmm_regime(window_returns)
+        ou = ou_reversion_signal(window_prices)
+        garch = garch_volatility_trust(window_returns)
+        feats = {
+            "markov_p": markov_directional_prob(window_returns),
+            "hawkes": hawkes_intensity(window_returns),
+            "trend_weight": hmm["trend_weight"],
+            "ou_dir": ou["reversion_dir"],
+            "ou_strength": ou["strength"],
+            "hurst": hurst_exponent(window_prices),
+            "arfima_bias": arfima_bias(window_returns),
+            "vol_trust": garch["trust"],
+            "entropy_trust": entropy_trust(window_returns),
+            "kalman": kalman_trend(window_prices),
+            "copula_agree": 0.5,
+        }
+        _, confidence = bayesian_fusion(feats)
+        scores.append(confidence)
+    return scores
+
+
 async def run_calibration(state, symbol_data, symbols, trigger_reason):
     state.trading_locked = True
     kind, symbol = trigger_reason
@@ -718,10 +790,26 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
         state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
         state.consecutive_losses[s] = 0
 
+        hist_scores = collect_historical_scores(symbol_data[s])
+        if hist_scores:
+            state.score_history[s].extend(hist_scores)
+
+    # pooled fallback threshold for symbols that haven't built up their own history yet -
+    # derived from every sample collected across all symbols so far, same percentile rule.
+    pooled = [v for hist in state.score_history.values() for v in hist]
+    if len(pooled) >= MIN_SCORE_SAMPLES:
+        state.global_threshold = float(np.clip(
+            np.percentile(np.array(pooled), THRESHOLD_PERCENTILE), THRESHOLD_FLOOR, THRESHOLD_CEILING
+        ))
+
+    per_symbol_thresholds = {s: round(dynamic_threshold_for(s, state), 3) for s in top_k}
     state.last_scheduled_calibration = time.time()
     state.last_calibration_end = time.time()
     elapsed = state.last_calibration_end - start
-    print(f"Calibration complete in {elapsed:.1f}s. Deep-dived: {top_k}")
+    print(
+        f"Calibration complete in {elapsed:.1f}s. Deep-dived: {top_k} | "
+        f"thresholds: {per_symbol_thresholds} | global_threshold={state.global_threshold:.3f}"
+    )
     state.trading_locked = False
 
 
@@ -809,13 +897,23 @@ async def main():
         if state.trading_locked or state.trade_in_progress:
             continue
 
+        now = time.time()
+        ticks_ready = sum(1 for s in symbols if len(symbol_data[s].ticks) >= MIN_TICKS_REQUIRED)
+
         trigger = check_calibration_triggers(state)
+        if not trigger and not state.initial_calibration_done and ticks_ready >= max(3, len(symbols) // 2):
+            # Tick collection is mostly done for the first time - run the calibrator now,
+            # before any live trade is evaluated, so dynamic_threshold_for() has an
+            # empirical distribution to read from instead of the BASE_CONFIDENCE_THRESHOLD
+            # placeholder. Falls back to the regular scheduled/loss-triggered cadence after.
+            trigger = ("initial_calibration", None)
+
         if trigger:
+            if trigger[0] == "initial_calibration":
+                state.initial_calibration_done = True
             await run_calibration(state, symbol_data, symbols, trigger)
             continue
 
-        now = time.time()
-        ticks_ready = sum(1 for s in symbols if len(symbol_data[s].ticks) >= MIN_TICKS_REQUIRED)
         due_for_log = (now - last_status_log) >= STATUS_LOG_INTERVAL
 
         # pass 1: raw momentum per symbol, needed for the copula confirmation layer
@@ -843,27 +941,31 @@ async def main():
             feats = compute_features(sd, raw_momentum)
             p_up, confidence = bayesian_fusion(feats)
             symbol_scores[s] = (p_up, confidence)
+            # feed the live score into this symbol's empirical distribution so the
+            # dynamic threshold keeps adapting between calibrator runs too.
+            state.score_history[s].append(confidence * state.reliability.get(s, 1.0))
 
-        pick = select_trade(symbol_scores, state.reliability)
+        pick = select_trade(symbol_scores, state)
 
         if pick or due_for_log:
             ranked = sorted(
                 (
-                    (s, p_up, conf, conf * state.reliability.get(s, 1.0))
+                    (s, p_up, conf, conf * state.reliability.get(s, 1.0), dynamic_threshold_for(s, state))
                     for s, (p_up, conf) in symbol_scores.items()
                 ),
                 key=lambda x: x[3],
                 reverse=True,
             )
             top3 = ", ".join(
-                f"{s}({'UP' if p > 0.5 else 'DN'} p={p:.2f} score={sc:.2f})" for s, p, c, sc in ranked[:3]
+                f"{s}({'UP' if p > 0.5 else 'DN'} p={p:.2f} score={sc:.2f}/thr={th:.2f})"
+                for s, p, c, sc, th in ranked[:3]
             )
             if pick:
                 print(f"[scan] candidates: {top3}")
             else:
                 best = ranked[0]
-                if best[3] < CONFIDENCE_THRESHOLD:
-                    reason = f"top score {best[3]:.2f} below threshold {CONFIDENCE_THRESHOLD}"
+                if best[3] < best[4]:
+                    reason = f"top score {best[3]:.2f} below its threshold {best[4]:.2f}"
                 elif len(ranked) > 1 and (ranked[0][3] - ranked[1][3]) < MIN_SCORE_GAP:
                     reason = f"gap {ranked[0][3] - ranked[1][3]:.3f} below required {MIN_SCORE_GAP}"
                 else:
@@ -884,7 +986,8 @@ async def main():
         )
         print(
             f"Selected {symbol} dir={'UP' if direction > 0 else 'DOWN'} "
-            f"p_up={p_up:.3f} score={score:.3f} duration={duration}t exp_win={exp_win_rate:.2f}"
+            f"p_up={p_up:.3f} score={score:.3f} threshold={dynamic_threshold_for(symbol, state):.3f} "
+            f"duration={duration}t exp_win={exp_win_rate:.2f}"
         )
         await execute_sequence(client, state, symbol, direction, duration)
 
