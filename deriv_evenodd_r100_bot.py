@@ -86,6 +86,8 @@ CANDIDATE_DURATIONS = [1, 3, 5, 10, 15]  # ticks, Monte Carlo picks the best of 
 
 MIN_TICKS_REQUIRED = 60                # minimum ticks buffered before a symbol is scored
 
+STATUS_LOG_INTERVAL = 10               # seconds between heartbeat scan summaries (visibility into idle loop)
+
 
 # ---------------------------------------------------------------------------
 # SHARED STATE  (single source of truth - every module reads/writes through this)
@@ -800,6 +802,7 @@ async def main():
     asyncio.create_task(balance_consumer(balance_queue, state))
 
     print("Bot running. Entering main decision loop.")
+    last_status_log = 0.0
     while True:
         await asyncio.sleep(2)
 
@@ -811,6 +814,10 @@ async def main():
             await run_calibration(state, symbol_data, symbols, trigger)
             continue
 
+        now = time.time()
+        ticks_ready = sum(1 for s in symbols if len(symbol_data[s].ticks) >= MIN_TICKS_REQUIRED)
+        due_for_log = (now - last_status_log) >= STATUS_LOG_INTERVAL
+
         # pass 1: raw momentum per symbol, needed for the copula confirmation layer
         raw_momentum = {}
         for s in symbols:
@@ -821,6 +828,12 @@ async def main():
             raw_momentum[s] = hawkes_intensity(returns) * 0.6 + kalman_trend(sd.prices()) * 0.4
 
         if not raw_momentum:
+            if due_for_log:
+                print(
+                    f"[scan] balance={state.balance:.2f} | {ticks_ready}/{len(symbols)} symbols "
+                    f"have {MIN_TICKS_REQUIRED}+ ticks buffered | waiting for data..."
+                )
+                last_status_log = now
             continue
 
         # pass 2: full feature fusion per symbol
@@ -832,6 +845,35 @@ async def main():
             symbol_scores[s] = (p_up, confidence)
 
         pick = select_trade(symbol_scores, state.reliability)
+
+        if pick or due_for_log:
+            ranked = sorted(
+                (
+                    (s, p_up, conf, conf * state.reliability.get(s, 1.0))
+                    for s, (p_up, conf) in symbol_scores.items()
+                ),
+                key=lambda x: x[3],
+                reverse=True,
+            )
+            top3 = ", ".join(
+                f"{s}({'UP' if p > 0.5 else 'DN'} p={p:.2f} score={sc:.2f})" for s, p, c, sc in ranked[:3]
+            )
+            if pick:
+                print(f"[scan] candidates: {top3}")
+            else:
+                best = ranked[0]
+                if best[3] < CONFIDENCE_THRESHOLD:
+                    reason = f"top score {best[3]:.2f} below threshold {CONFIDENCE_THRESHOLD}"
+                elif len(ranked) > 1 and (ranked[0][3] - ranked[1][3]) < MIN_SCORE_GAP:
+                    reason = f"gap {ranked[0][3] - ranked[1][3]:.3f} below required {MIN_SCORE_GAP}"
+                else:
+                    reason = "no qualifying signal"
+                print(
+                    f"[scan] balance={state.balance:.2f} | {ticks_ready}/{len(symbols)} ready | "
+                    f"candidates: {top3} | WAIT ({reason})"
+                )
+            last_status_log = now
+
         if not pick:
             continue
 
