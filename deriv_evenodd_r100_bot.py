@@ -154,6 +154,8 @@ class DerivClient:
         self.account = None
         self.resubscribe_cb = None  # async callable(client), replayed after reconnect
         self._running = False
+        self._reader_task = None
+        self._ka_task = None
 
     # ---- REST bootstrap ----
     def _rest_headers(self):
@@ -202,15 +204,22 @@ class DerivClient:
     # ---- connection lifecycle ----
     async def connect(self):
         """Connects once (raises on failure, so startup misconfiguration
-        fails fast) then runs the reconnect loop forever in the background."""
+        fails fast) then runs the supervisor loop forever in the background."""
         self._running = True
         await self._connect_once()
-        asyncio.create_task(self._run_forever())
+        asyncio.create_task(self._supervise())
         return self.account
 
     async def _connect_once(self):
         ws_url = await self._get_ws_url()
         self.ws = await websockets.connect(ws_url, ping_interval=None, close_timeout=5)
+        # IMPORTANT: start the reader (and heartbeat) BEFORE sending anything.
+        # `send()` blocks on a future that is only resolved by `_dispatch()`,
+        # which only runs inside `_read_loop()`. If the reader isn't already
+        # running, the balance handshake below times out forever (this was
+        # the cause of the repeated TimeoutError/CancelledError crash loop).
+        self._reader_task = asyncio.create_task(self._read_loop())
+        self._ka_task = asyncio.create_task(self._heartbeat())
         bal = await self.send({"balance": 1})
         self.account = bal.get("balance", {})
         print(
@@ -218,21 +227,28 @@ class DerivClient:
             f"loginid={self.account.get('loginid')} balance={self.account.get('balance')}"
         )
 
-    async def _run_forever(self):
+    async def _read_loop(self):
+        try:
+            async for message in self.ws:
+                self._dispatch(json.loads(message))
+        except (websockets.ConnectionClosed, OSError) as e:
+            print(f"[DerivClient] WS connection lost: {e}")
+
+    async def _supervise(self):
+        """Watches the current reader task; on disconnect, cleans up and
+        reconnects with exponential backoff, restarting reader+heartbeat
+        each time inside `_connect_once`."""
         while self._running:
-            ka_task = asyncio.create_task(self._heartbeat())
-            try:
-                async for message in self.ws:
-                    self._dispatch(json.loads(message))
-            except (websockets.ConnectionClosed, OSError) as e:
-                print(f"[DerivClient] WS connection lost: {e}")
-            finally:
-                ka_task.cancel()
-                for fut in self.pending.values():
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("Deriv WS disconnected"))
-                self.pending.clear()
-                self.ws = None
+            if self._reader_task is not None:
+                await self._reader_task
+
+            if self._ka_task is not None:
+                self._ka_task.cancel()
+            for fut in self.pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("Deriv WS disconnected"))
+            self.pending.clear()
+            self.ws = None
 
             if not self._running:
                 break
