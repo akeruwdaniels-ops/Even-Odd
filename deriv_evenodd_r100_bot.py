@@ -80,7 +80,7 @@ MAX_LOSS_CALIBRATIONS_PER_24H = 3              # rate limiter, default - tune as
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
 TOP_K_DEEP_DIVE = 5                            # symbols deep-validated per calibration
 
-CONFIDENCE_THRESHOLD = 0.58            # minimum ensemble score to trade (0-1 scale)
+CONFIDENCE_THRESHOLD = 0.52            # minimum ensemble score to trade (0-1 scale)
 MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
 CANDIDATE_DURATIONS = [1, 3, 5, 10, 15]  # ticks, Monte Carlo picks the best of these
 
