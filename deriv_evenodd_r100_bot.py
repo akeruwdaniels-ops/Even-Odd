@@ -12,23 +12,46 @@ A symbol calibrator runs on a 2-hour schedule and on per-symbol 2-loss
 triggers (rate-limited), pausing trading while it re-validates symbols and
 updates per-symbol reliability multipliers.
 
+CONNECTION: new Deriv Options API (REST OTP bootstrap), verified against
+developers.deriv.com as of 2026-06:
+    REST  GET  /trading/v1/options/accounts            -> resolve account_id
+    REST  POST /trading/v1/options/accounts/{id}/otp    -> pre-auth WS URL
+    No `authorize` message needed - the OTP URL is already authenticated.
+    OTP tokens are short-lived/single-use, so a fresh one is fetched on
+    every (re)connect; the client auto-reconnects with backoff and replays
+    subscriptions (balance + ticks for every symbol) after each reconnect.
+    `active_symbols` no longer accepts `product_type`; its response field
+    is `underlying_symbol` (not `symbol`). `contracts_for` no longer takes
+    `currency`. Buy `parameters` now requires `underlying_symbol` (not
+    `symbol`). Tick responses keep the `symbol` field unchanged.
+
 NOTE ON SIMPLIFICATIONS: several layers (HMM, GARCH, ARFIMA, copula) are
 implemented as lightweight, dependency-free numpy approximations rather than
 full statsmodels/hmmlearn/arch implementations, to keep the Railway deploy
-to two pip packages (websockets, numpy). Swap in heavier libraries later if
-you want more statistical rigor once this is validated end to end.
+to three pip packages (websockets, numpy, requests). Swap in heavier
+libraries later if you want more statistical rigor once this is validated
+end to end.
 
-ENV VARS REQUIRED:
-    DERIV_API_TOKEN   - API token for your Deriv account
-    DERIV_APP_ID      - your registered app_id (defaults to demo app id 1089)
+ENV VARS:
+    DERIV_API_TOKEN     - REQUIRED. PAT or JWT token for your Deriv account.
+    DERIV_APP_ID        - REQUIRED. Your registered app_id from
+                           developers.deriv.com (legacy app_ids, e.g. the
+                           old demo id 1089, do NOT work with the new API).
+    DERIV_ACCOUNT_TYPE  - "demo" (default, safe) or "real". Picked explicitly
+                           rather than guessed, so the bot never trades on
+                           your real-money account by accident.
+    DERIV_ACCOUNT_ID    - Optional. Skips the accounts lookup and uses this
+                           account_id directly.
 """
 
 import asyncio
+import random
 import websockets
 import json
 import os
 import time
 import math
+import requests
 import numpy as np
 from collections import deque, defaultdict
 from datetime import datetime
@@ -36,9 +59,14 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # CONFIG  (tune these via your walk-forward validation before going live)
 # ---------------------------------------------------------------------------
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
+DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID")  # optional, skips lookup
+
+API_BASE = "https://api.derivws.com"
+ACCOUNTS_PATH = "/trading/v1/options/accounts"
+OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
@@ -93,40 +121,158 @@ class SymbolData:
 
 
 # ---------------------------------------------------------------------------
-# DERIV API CLIENT (minimal async wrapper over the public websocket API)
+# DERIV API CLIENT - new Options API (REST OTP bootstrap, auto-reconnecting)
 # ---------------------------------------------------------------------------
 class DerivClient:
-    def __init__(self, ws_url, token):
-        self.ws_url = ws_url
+    """
+    Client for the new Deriv Options API.
+
+    Auth flow: REST GET .../accounts -> resolve account_id -> REST POST
+    .../accounts/{id}/otp -> pre-authenticated WS URL. No `authorize`
+    message is sent or needed; the OTP URL is already scoped to the account.
+
+    OTP URLs are short-lived and single-use (per developers.deriv.com), so a
+    fresh one is fetched on every connect AND every reconnect. After the
+    first successful connect, this client auto-reconnects in the background
+    with exponential backoff and calls `resubscribe_cb` (if set) so the
+    caller can replay its balance/tick subscriptions.
+    """
+
+    HEARTBEAT_INTERVAL = 20
+    RECONNECT_BASE = 2.0
+    RECONNECT_CAP = 60.0
+
+    def __init__(self, app_id, token, account_type="demo", account_id=None):
+        self.app_id = app_id
         self.token = token
+        self.account_type = account_type
+        self.account_id = account_id
         self.ws = None
         self.req_id = 0
         self.pending = {}
         self.subscriptions = defaultdict(list)  # msg_type -> list[asyncio.Queue]
         self.account = None
+        self.resubscribe_cb = None  # async callable(client), replayed after reconnect
+        self._running = False
 
+    # ---- REST bootstrap ----
+    def _rest_headers(self):
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Deriv-App-ID": self.app_id,
+            "Content-Type": "application/json",
+        }
+
+    def _resolve_account_id_sync(self):
+        url = f"{API_BASE}{ACCOUNTS_PATH}"
+        resp = requests.get(url, headers=self._rest_headers(), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        accounts = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(accounts, dict):
+            accounts = accounts.get("accounts", accounts.get("data", []))
+        for acc in accounts:
+            if acc.get("account_type") == self.account_type:
+                acc_id = acc.get("account_id") or acc.get("id")
+                if acc_id:
+                    return acc_id
+        raise RuntimeError(
+            f"No '{self.account_type}' account found via {ACCOUNTS_PATH}. "
+            f"Set DERIV_ACCOUNT_ID explicitly, or create one first via "
+            f"POST {ACCOUNTS_PATH}. Accounts returned: {data}"
+        )
+
+    def _fetch_otp_url_sync(self):
+        if not self.account_id:
+            self.account_id = self._resolve_account_id_sync()
+            print(f"Resolved {self.account_type} account_id = {self.account_id}")
+        url = f"{API_BASE}{OTP_PATH.format(account_id=self.account_id)}"
+        resp = requests.post(url, headers=self._rest_headers(), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        payload = data.get("data", data) if isinstance(data, dict) else data
+        ws_url = payload.get("url")
+        if not ws_url:
+            raise RuntimeError(f"OTP response missing data.url: {data}")
+        return ws_url
+
+    async def _get_ws_url(self):
+        return await asyncio.to_thread(self._fetch_otp_url_sync)
+
+    # ---- connection lifecycle ----
     async def connect(self):
-        self.ws = await websockets.connect(self.ws_url, ping_interval=20)
-        asyncio.create_task(self._reader())
-        auth = await self.send({"authorize": self.token})
-        if "error" in auth:
-            raise RuntimeError(f"Authorization failed: {auth['error']}")
-        self.account = auth["authorize"]
+        """Connects once (raises on failure, so startup misconfiguration
+        fails fast) then runs the reconnect loop forever in the background."""
+        self._running = True
+        await self._connect_once()
+        asyncio.create_task(self._run_forever())
         return self.account
 
-    async def _reader(self):
-        async for message in self.ws:
-            data = json.loads(message)
-            req_id = data.get("req_id")
-            msg_type = data.get("msg_type")
-            if req_id is not None and req_id in self.pending:
-                fut = self.pending.pop(req_id)
-                if not fut.done():
-                    fut.set_result(data)
-                    continue
-            if msg_type in self.subscriptions:
-                for q in self.subscriptions[msg_type]:
-                    await q.put(data)
+    async def _connect_once(self):
+        ws_url = await self._get_ws_url()
+        self.ws = await websockets.connect(ws_url, ping_interval=None, close_timeout=5)
+        bal = await self.send({"balance": 1})
+        self.account = bal.get("balance", {})
+        print(
+            f"Connected ({self.account_type}). "
+            f"loginid={self.account.get('loginid')} balance={self.account.get('balance')}"
+        )
+
+    async def _run_forever(self):
+        while self._running:
+            ka_task = asyncio.create_task(self._heartbeat())
+            try:
+                async for message in self.ws:
+                    self._dispatch(json.loads(message))
+            except (websockets.ConnectionClosed, OSError) as e:
+                print(f"[DerivClient] WS connection lost: {e}")
+            finally:
+                ka_task.cancel()
+                for fut in self.pending.values():
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("Deriv WS disconnected"))
+                self.pending.clear()
+                self.ws = None
+
+            if not self._running:
+                break
+
+            attempt = 0
+            while self._running and self.ws is None:
+                attempt += 1
+                delay = min(
+                    self.RECONNECT_BASE * (2 ** (attempt - 1)), self.RECONNECT_CAP
+                ) + random.uniform(0, 1)
+                print(f"[DerivClient] Reconnecting in {delay:.1f}s (attempt {attempt})...")
+                await asyncio.sleep(delay)
+                try:
+                    await self._connect_once()
+                    if self.resubscribe_cb:
+                        await self.resubscribe_cb(self)
+                except Exception as e:
+                    print(f"[DerivClient] Reconnect attempt {attempt} failed: {e}")
+
+    async def _heartbeat(self):
+        try:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+                await self.ws.send(json.dumps({"ping": 1}))
+        except (asyncio.CancelledError, websockets.ConnectionClosed):
+            pass
+
+    def _dispatch(self, data):
+        req_id = data.get("req_id")
+        msg_type = data.get("msg_type")
+        if msg_type == "ping":
+            return
+        if req_id is not None and req_id in self.pending:
+            fut = self.pending.pop(req_id)
+            if not fut.done():
+                fut.set_result(data)
+                return
+        if msg_type in self.subscriptions:
+            for q in self.subscriptions[msg_type]:
+                q.put_nowait(data)
 
     async def send(self, request, timeout=20):
         self.req_id += 1
@@ -147,12 +293,16 @@ class DerivClient:
 async def fetch_tradable_symbols(client):
     """Builds the symbol universe dynamically: synthetic indices only,
     1HZ variants excluded, and only symbols that actually support CALL/PUT
-    (rise/fall) contracts. Avoids hardcoding symbol codes that drift over time."""
-    resp = await client.send({"active_symbols": "brief", "product_type": "basic"})
+    (rise/fall) contracts. Avoids hardcoding symbol codes that drift over time.
+
+    New API: `active_symbols` no longer accepts `product_type` (removed -
+    additionalProperties is false, so sending it would be rejected), and its
+    response field is `underlying_symbol` (renamed from `symbol`)."""
+    resp = await client.send({"active_symbols": "brief"})
     candidates = []
     for s in resp.get("active_symbols", []):
-        symbol = s["symbol"]
-        if "1HZ" in symbol:
+        symbol = s.get("underlying_symbol")
+        if not symbol or "1HZ" in symbol:
             continue
         if s.get("market") != "synthetic_index":
             continue
@@ -163,7 +313,7 @@ async def fetch_tradable_symbols(client):
     verified = []
     for symbol in candidates:
         try:
-            cf = await client.send({"contracts_for": symbol, "currency": "USD"})
+            cf = await client.send({"contracts_for": symbol})
             types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
             if "CALL" in types and "PUT" in types:
                 verified.append(symbol)
@@ -175,7 +325,7 @@ async def fetch_tradable_symbols(client):
 async def buy_contract(client, symbol, direction, duration, duration_unit, stake):
     contract_type = "CALL" if direction > 0 else "PUT"
     req = {
-        "buy": 1,
+        "buy": "1",
         "price": stake,
         "parameters": {
             "amount": stake,
@@ -184,7 +334,7 @@ async def buy_contract(client, symbol, direction, duration, duration_unit, stake
             "currency": "USD",
             "duration": duration,
             "duration_unit": duration_unit,
-            "symbol": symbol,
+            "underlying_symbol": symbol,
         },
     }
     resp = await client.send(req)
@@ -585,16 +735,29 @@ async def balance_consumer(queue, state):
 async def main():
     if not DERIV_API_TOKEN:
         raise RuntimeError("Set the DERIV_API_TOKEN environment variable.")
+    if not DERIV_APP_ID:
+        raise RuntimeError(
+            "Set the DERIV_APP_ID environment variable to your app_id from "
+            "developers.deriv.com. Legacy app_ids (e.g. the old demo id "
+            "1089) do NOT work with the new Options API."
+        )
+    if DERIV_ACCOUNT_TYPE not in ("demo", "real"):
+        raise RuntimeError("DERIV_ACCOUNT_TYPE must be 'demo' or 'real'.")
+    if DERIV_ACCOUNT_TYPE == "real":
+        print("!" * 72)
+        print("! DERIV_ACCOUNT_TYPE=real - this bot will trade with REAL MONEY.    !")
+        print("! Set DERIV_ACCOUNT_TYPE=demo (or unset it) to use a demo account.  !")
+        print("!" * 72)
 
-    client = DerivClient(WS_URL, DERIV_API_TOKEN)
+    client = DerivClient(
+        DERIV_APP_ID, DERIV_API_TOKEN,
+        account_type=DERIV_ACCOUNT_TYPE, account_id=DERIV_ACCOUNT_ID,
+    )
     account = await client.connect()
     print(f"Authorized as {account.get('loginid')}")
 
-    balance_resp = await client.send({"balance": 1, "subscribe": 1})
-    balance_queue = client.subscribe_channel("balance")
-
     state = TradeState()
-    state.balance = balance_resp["balance"]["balance"]
+    state.balance = account.get("balance", 0.0)
     print(f"Starting balance: {state.balance}")
 
     symbols = await fetch_tradable_symbols(client)
@@ -604,8 +767,18 @@ async def main():
 
     symbol_data = {s: SymbolData(s) for s in symbols}
     tick_queue = client.subscribe_channel("tick")
-    for s in symbols:
-        await client.send({"ticks": s, "subscribe": 1})
+    balance_queue = client.subscribe_channel("balance")
+
+    async def subscribe_all(c):
+        """Replays balance + per-symbol tick subscriptions. Used for the
+        initial subscribe and re-run as `resubscribe_cb` after every
+        reconnect (a fresh OTP session has no memory of prior subscriptions)."""
+        await c.send({"balance": 1, "subscribe": 1})
+        for s in symbols:
+            await c.send({"ticks": s, "subscribe": 1})
+
+    client.resubscribe_cb = subscribe_all
+    await subscribe_all(client)
 
     asyncio.create_task(tick_consumer(tick_queue, symbol_data))
     asyncio.create_task(balance_consumer(balance_queue, state))
